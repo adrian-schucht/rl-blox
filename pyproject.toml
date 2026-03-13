@@ -54,13 +54,21 @@ logging = [
     "orbax-checkpoint",
     "mlflow",
 ]
+tdmpc2 = [
+    "recordclass",
+    "torch",
+    "torchrl",
+    "tensordict",
+    "array-api-compat",
+    "termcolor",
+]
 examples = ["gymnasium[classic-control,toy-text,mujoco]", "matplotlib"]
 doc = [
     "sphinx",
     "pydata-sphinx-theme",
     "numpydoc",
 ]
-all = ["rl_blox[dev,examples,logging,doc]"]
+all = ["rl_blox[dev,tdmpc2,examples,logging,doc]"]
 
 [project.urls]
 Homepage = "https://github.com/mlaux1/rl-blox"
