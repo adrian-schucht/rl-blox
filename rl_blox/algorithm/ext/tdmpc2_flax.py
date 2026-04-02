@@ -30,9 +30,6 @@
 import os
 from recordclass import recordclass
 
-from rl_blox.logging.logger import LoggerBase
-from rl_blox.logging.timer import Timer
-
 os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
 os.environ["LAZY_LEGACY_OP"] = "0"
 os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
@@ -48,6 +45,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import jax
+from jax import Array
+import jax.numpy as jnp
+from jax.typing import ArrayLike
+from flax import nnx
 import gymnasium as gym
 from gymnasium.wrappers import NumpyToTorch
 import numpy as np
@@ -62,6 +64,10 @@ from termcolor import colored
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 from tqdm.rich import trange
+
+from rl_blox.logging.logger import LoggerBase
+from rl_blox.logging.timer import Timer
+
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
@@ -634,11 +640,19 @@ def make_training_cfg(
     )
 
 
-def soft_ce(pred, target, vmin, vmax, bin_size, num_bins):
-    """Computes the cross entropy loss between predictions and soft targets."""
-    pred = F.log_softmax(pred, dim=-1)
+@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
+def soft_ce(
+    pred: ArrayLike,
+    target: ArrayLike,
+    vmin: float,
+    vmax: float,
+    bin_size: float,
+    num_bins: int,
+):
+    """Compute the cross entropy loss between predictions and soft targets."""
+    pred = nnx.log_softmax(pred, axis=-1)
     target = two_hot(target, vmin, vmax, bin_size, num_bins)
-    return -(target * pred).sum(-1, keepdim=True)
+    return -jnp.sum(target * pred, axis=-1, keepdims=True)
 
 
 def safe_log_std(x, low, dif):
@@ -671,53 +685,68 @@ def int_to_one_hot(x, num_classes):
     return one_hot
 
 
-def symlog(x):
+@jax.jit
+def symlog(x: ArrayLike) -> Array:
     """
     Symmetric logarithmic function.
     Adapted from https://github.com/danijar/dreamerv3.
     """
-    return torch.sign(x) * torch.log(1 + torch.abs(x))
+    return jnp.sign(x) * jnp.log(1 + jnp.abs(x))
 
 
-def symexp(x):
+@jax.jit
+def symexp(x: ArrayLike) -> Array:
     """
     Symmetric exponential function.
     Adapted from https://github.com/danijar/dreamerv3.
     """
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+    return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1)
 
 
-def two_hot(x, vmin, vmax, bin_size, num_bins):
-    """Converts a batch of scalars to soft two-hot encoded targets for discrete regression."""
+# TODO: squeeze x, 1
+@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
+def two_hot(
+    x: ArrayLike,
+    vmin: float,
+    vmax: float,
+    bin_size: float,
+    num_bins: int,
+) -> Array:
+    """Convert array of scalars to soft two-hot encoded targets for discrete
+    regression"""
     if num_bins == 0:
-        return x
+        return jnp.array(x)
     elif num_bins == 1:
         return symlog(x)
-    x = torch.clamp(symlog(x), vmin, vmax).squeeze(1)
-    bin_idx = torch.floor((x - vmin) / bin_size)
-    bin_offset = ((x - vmin) / bin_size - bin_idx).unsqueeze(-1)
-    soft_two_hot = torch.zeros(
-        x.shape[0], num_bins, device=x.device, dtype=x.dtype
-    )
-    bin_idx = bin_idx.long()
-    soft_two_hot = soft_two_hot.scatter(1, bin_idx.unsqueeze(1), 1 - bin_offset)
-    soft_two_hot = soft_two_hot.scatter(
-        1, (bin_idx.unsqueeze(1) + 1) % num_bins, bin_offset
-    )
+    x = jnp.clip(symlog(x), vmin, vmax)
+    bin_idx = jnp.floor((x - vmin) / bin_size)
+    bin_offset = (x - vmin) / bin_size - bin_idx
+    soft_two_hot = jnp.zeros((x.shape[0], num_bins), dtype=x.dtype)
+    soft_two_hot = soft_two_hot.at[
+        jnp.arange(x.shape[0]), bin_idx.astype(dtype=int)
+    ].set(1 - bin_offset)
+    soft_two_hot = soft_two_hot.at[
+        jnp.arange(x.shape[0]), bin_idx.astype(dtype=int) + 1
+    ].set(bin_offset)
     return soft_two_hot
 
 
-def two_hot_inv(x, vmin, vmax, num_bins):
-    """Converts a batch of soft two-hot encoded vectors to scalars."""
+@partial(jax.jit, static_argnames=["vmin", "vmax", "num_bins"])
+def two_hot_inv(
+    x: ArrayLike,
+    vmin: float,
+    vmax: float,
+    num_bins: int,
+):
+    """Convert an array of soft two-hot encoded vectors to an array of
+    scalars."""
     if num_bins == 0:
-        return x
+        return jnp.array(x)
     elif num_bins == 1:
         return symexp(x)
-    dreg_bins = torch.linspace(
-        vmin, vmax, num_bins, device=x.device, dtype=x.dtype
-    )
-    x = F.softmax(x, dim=-1)
-    x = torch.sum(x * dreg_bins, dim=-1, keepdim=True)
+    x = nnx.softmax(x, axis=-1)
+    dreg_bins = jnp.linspace(vmin, vmax, num_bins, dtype=x.dtype)
+    x = jnp.sum(x * dreg_bins, axis=-1)
     return symexp(x)
 
 
