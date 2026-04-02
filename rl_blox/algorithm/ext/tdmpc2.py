@@ -290,7 +290,7 @@ AgentConfig = recordclass(
         "action_dim",
         "episode_length",
         "obs_shape",
-    ]
+    ],
 )
 
 TrainingConfig = recordclass(
@@ -302,12 +302,12 @@ TrainingConfig = recordclass(
         "buffer_size",
         "seed_steps",
         "progress_bar",
-    ]
+    ],
 )
 
 FullTrainingConfig = recordclass(
     "FullTrainingConfig",
-    [ # Fields are specified explicitly to prevent auto code inspection false positives
+    [  # Fields are specified explicitly to prevent auto code inspection false positives
         "task",
         "obs",
         "batch_size",
@@ -358,71 +358,72 @@ FullTrainingConfig = recordclass(
         "buffer_size",
         "seed_steps",
         "progress_bar",
-    ]
+    ],
 )
 
+
 def make_agent_cfg(
-        task: str,
-        obs: str ="state",
-        # Planning
-        horizon: int =3,
-        iterations: int =6,
-        num_samples: int =512,
-        num_pi_trajs: int =24,
-        num_elites: int =64,
-        min_std: float =0.05,
-        max_std: float =2,
-        temperature: float=0.5,
-        # momentun: No
-        # Policy prior
-        log_std_min: float=-10,
-        log_std_max: float=2,
-        # Replay buffer (Nothing)
-        # capacity: 1_000_000
-        # sampling: uniform
-        # Architecture
-        model_size: int=5,  # 1, 5, 19, 48, 317
-        enc_dim: int=256,
-        num_enc_layers: int=2, # additional
-        mlp_dim: int=512,
-        latent_dim: int=512,
-        # task embedding dim: 96
-        # task embedding norm: 1
-        # activation: layernorm + mish
-        dropout: float=0.01,
-        num_q: int=5,
-        num_bins: int = 101,
-        simnorm_dim: int = 8,
-        # simnorm temperature (tau): 1
-        # Optimization
-        # update to data ratio: 1
-        batch_size: int = 256,
-        consistency_coef=20,
-        reward_coef=0.1,
-        value_coef=0.1,
-        rho=0.5, # lambda in the paper
-        # q function momentum coef: 0.99
-        entropy_coef: float = 1e-4,
-        # policy prior loss norm: Moving (5%,95%) percentiles
-        # optimizer: Adam
-        lr: float = 3e-4,
-        enc_lr_scale=0.3,
-        grad_clip_norm=20,
-        num_channels: int=32,
-        # training
-        tau=0.01,
-        discount_denom=5,
-        discount_min=0.95,
-        discount_max=0.995,
-        # planning
-        mpc: bool =True,
-        # actor
-        # critic
-        vmin: float=-10,
-        vmax: float=+10,
-        # architecture
-        # speedups
-        compile: bool=False,
+    task: str,
+    obs: str = "state",
+    # Planning
+    horizon: int = 3,
+    iterations: int = 6,
+    num_samples: int = 512,
+    num_pi_trajs: int = 24,
+    num_elites: int = 64,
+    min_std: float = 0.05,
+    max_std: float = 2,
+    temperature: float = 0.5,
+    # momentun: No
+    # Policy prior
+    log_std_min: float = -10,
+    log_std_max: float = 2,
+    # Replay buffer (Nothing)
+    # capacity: 1_000_000
+    # sampling: uniform
+    # Architecture
+    model_size: int = 5,  # 1, 5, 19, 48, 317
+    enc_dim: int = 256,
+    num_enc_layers: int = 2,  # additional
+    mlp_dim: int = 512,
+    latent_dim: int = 512,
+    # task embedding dim: 96
+    # task embedding norm: 1
+    # activation: layernorm + mish
+    dropout: float = 0.01,
+    num_q: int = 5,
+    num_bins: int = 101,
+    simnorm_dim: int = 8,
+    # simnorm temperature (tau): 1
+    # Optimization
+    # update to data ratio: 1
+    batch_size: int = 256,
+    consistency_coef=20,
+    reward_coef=0.1,
+    value_coef=0.1,
+    rho=0.5,  # lambda in the paper
+    # q function momentum coef: 0.99
+    entropy_coef: float = 1e-4,
+    # policy prior loss norm: Moving (5%,95%) percentiles
+    # optimizer: Adam
+    lr: float = 3e-4,
+    enc_lr_scale=0.3,
+    grad_clip_norm=20,
+    num_channels: int = 32,
+    # training
+    tau=0.01,
+    discount_denom=5,
+    discount_min=0.95,
+    discount_max=0.995,
+    # planning
+    mpc: bool = True,
+    # actor
+    # critic
+    vmin: float = -10,
+    vmax: float = +10,
+    # architecture
+    # speedups
+    compile: bool = False,
 ) -> AgentConfig:
     """Create the agent-specific configuration for TD-MPC2.
 
@@ -539,7 +540,9 @@ def make_agent_cfg(
     # Model size
     if model_size is not None:
         if model_size not in MODEL_SIZE:
-            raise ValueError(f"Invalid model size {model_size}. Must be one of {list(MODEL_SIZE.keys())}")
+            raise ValueError(
+                f"Invalid model size {model_size}. Must be one of {list(MODEL_SIZE.keys())}"
+            )
         enc_dim = MODEL_SIZE[model_size]["enc_dim"]
         mlp_dim = MODEL_SIZE[model_size]["mlp_dim"]
         latent_dim = MODEL_SIZE[model_size]["latent_dim"]
@@ -585,20 +588,21 @@ def make_agent_cfg(
         simnorm_dim=simnorm_dim,
         compile=compile,
         tasks=TASK_SET.get(task, [task]),
-        bin_size=None, # Set during training
-        action_dim=None, # Set during training
-        episode_length=None, # Set during training
-        obs_shape=None, # Set during training
+        bin_size=None,  # Set during training
+        action_dim=None,  # Set during training
+        episode_length=None,  # Set during training
+        obs_shape=None,  # Set during training
     )
 
+
 def make_training_cfg(
-        # eval
-        eval_episodes=10,
-        eval_freq=50_000,
-        steps=10_000_000,
-        # training
-        buffer_size=1_000_000,
-        progress_bar=True,
+    # eval
+    eval_episodes=10,
+    eval_freq=50_000,
+    steps=10_000_000,
+    # training
+    buffer_size=1_000_000,
+    progress_bar=True,
 ) -> TrainingConfig:
     """Create the training-specific configuration for TD-MPC2.
 
@@ -625,9 +629,10 @@ def make_training_cfg(
         eval_freq=eval_freq,
         steps=steps,
         buffer_size=buffer_size,
-        seed_steps=None, # None -> heuristic
+        seed_steps=None,  # None -> heuristic
         progress_bar=progress_bar,
     )
+
 
 def soft_ce(pred, target, vmin, vmax, bin_size, num_bins):
     """Computes the cross entropy loss between predictions and soft targets."""
@@ -831,9 +836,17 @@ class NumpyToTorchSpaces(gym.Wrapper):
 
     def step(self, action):
         obs, reward, termination, truncation, info = self.env.step(action)
-        return torch.tensor(obs, dtype=torch.float32), torch.tensor(reward, dtype=torch.float32), termination, truncation, info
+        return (
+            torch.tensor(obs, dtype=torch.float32),
+            torch.tensor(reward, dtype=torch.float32),
+            termination,
+            truncation,
+            info,
+        )
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+    def reset(
+        self, *, seed: int | None = None, options: dict[str, Any] | None = None
+    ):
         obs, info = self.env.reset(seed=seed, options=options)
         return torch.tensor(obs, dtype=torch.float32), info
 
@@ -896,7 +909,7 @@ class Buffer:
             ]
         ) / len(tds)
         total_bytes = bytes_per_step * self._capacity
-        print(f"Storage required: {total_bytes/1e9:.2f} GB")
+        print(f"Storage required: {total_bytes / 1e9:.2f} GB")
         # Heuristic: decide whether to use CUDA or CPU memory
         storage_device = "cuda:0" if 2.5 * total_bytes < mem_free else "cpu"
         print(f"Using {storage_device.upper()} memory for storage.")
@@ -960,7 +973,15 @@ class Buffer:
 class OnlineTrainer:
     """Trainer class for single-task online TD-MPC2 training."""
 
-    def __init__(self, cfg, env, agent, buffer, logger : LoggerBase | None = None, timer: Timer = Timer()):
+    def __init__(
+        self,
+        cfg,
+        env,
+        agent,
+        buffer,
+        logger: LoggerBase | None = None,
+        timer: Timer = Timer(),
+    ):
         self.cfg = cfg
         self.env = env
         self.agent = agent
@@ -1009,7 +1030,9 @@ class OnlineTrainer:
         else:
             obs = obs.unsqueeze(0).cpu()
         if action is None:
-            action = torch.full_like(self.env.sample_action_space(), float("nan"))
+            action = torch.full_like(
+                self.env.sample_action_space(), float("nan")
+            )
         if reward is None:
             reward = torch.tensor(float("nan"))
         td = TensorDict(
@@ -1024,13 +1047,15 @@ class OnlineTrainer:
         """Train a TD-MPC2 agent."""
         done, eval_next = True, False
         steps_in_episode = 0
-        progress = trange(self._step, self.cfg.steps, disable=not self.cfg.progress_bar)
+        progress = trange(
+            self._step, self.cfg.steps, disable=not self.cfg.progress_bar
+        )
         self.timer.start("training")
         self.timer.start("seed_acquisition")
         for self._step in np.arange(self._step, self.cfg.steps + 1):
             # Evaluate agent periodically
             if self._step % self.cfg.eval_freq == 0:
-                eval_next = False # FIXME: originally True
+                eval_next = False  # FIXME: originally True
 
             # Reset environment
             if done:
@@ -1044,12 +1069,14 @@ class OnlineTrainer:
 
                 if self._step > 0:
                     episode_reward = torch.tensor(
-                            [td["reward"] for td in self._tds[1:]]
-                        ).sum()
+                        [td["reward"] for td in self._tds[1:]]
+                    ).sum()
                     episode_success = info["success"]
                     if self.logger is not None:
                         self.logger.record_stat("return", value=episode_reward)
-                        self.logger.record_stat("success", value=episode_success)
+                        self.logger.record_stat(
+                            "success", value=episode_success
+                        )
                         self.logger.stop_episode(steps_in_episode)
 
                     steps_in_episode = 0
@@ -1090,17 +1117,20 @@ class OnlineTrainer:
                     self.timer.start("agent_update")
                     metrics = self.agent.update(self.buffer)
                     self.timer.stop("agent_update")
-                    progress.update() # 1 update = 1 step, just not necessarily synchronously
+                    progress.update()  # 1 update = 1 step, just not necessarily synchronously
                     if i == num_updates - 1:
                         for k, v in metrics.items():
                             self.logger.record_stat(k, v)
-                self.logger.record_epoch(AGENT_CHECKPOINTING_ID, self.agent, step=self._step)
+                self.logger.record_epoch(
+                    AGENT_CHECKPOINTING_ID, self.agent, step=self._step
+                )
 
         # End last (potentially partial) episode # TODO: necessary?
         if self.logger is not None:
             self.timer.stop("training")
             self.timer.log(self.logger)
             self.logger.stop_episode(steps_in_episode)
+
 
 class TDMPC2(torch.nn.Module):
     """
@@ -1301,7 +1331,6 @@ class TDMPC2(torch.nn.Module):
 
         # Iterate MPPI
         for _ in range(self.cfg.iterations):
-
             # Sample actions
             r = torch.randn(
                 self.cfg.horizon,
@@ -1568,9 +1597,7 @@ class WorldModel(nn.Module):
             2 * [cfg.mlp_dim],
             max(cfg.num_bins, 1),
         )
-        self._pi = mlp(
-            cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim
-        )
+        self._pi = mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
         self._Qs = Ensemble(
             [
                 mlp(
@@ -2025,6 +2052,7 @@ def zero_(params):
     for p in params:
         p.data.fill_(0)
 
+
 def complete_config(
     env: gym.Env,
     agent_cfg: AgentConfig,
@@ -2054,7 +2082,9 @@ def complete_config(
     except:  # Box
         agent_cfg.obs_shape = {agent_cfg.obs: env.observation_space.shape}
     # Bin size for discrete regression
-    agent_cfg.bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (agent_cfg.num_bins - 1)
+    agent_cfg.bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (
+        agent_cfg.num_bins - 1
+    )
     agent_cfg.action_dim = env.action_space.shape[0]
     agent_cfg.episode_length = env.spec.max_episode_steps
     if training_cfg.seed_steps is None:
@@ -2063,11 +2093,12 @@ def complete_config(
     agent_cfg.iterations += 2 * int(agent_cfg.action_dim >= 20)
     return agent_cfg, training_cfg
 
+
 def train_tdmpc2(
     env: gym.Env,
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
-    rng_seed: int=1,
+    rng_seed: int = 1,
     logger: LoggerBase | None = None,
     timer: Timer = Timer(),
 ) -> TDMPC2:
