@@ -41,9 +41,10 @@ import datetime
 import random
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, override
 
 import jax
 from jax import Array
@@ -753,19 +754,19 @@ def two_hot_inv(
 
 def gumbel_softmax_sample(
     p: ArrayLike,
-    prng_key: ArrayLike, # TODO: PRNGKey
+    prng_key: ArrayLike,  # TODO: PRNGKey
     temperature: float = 1.0,
     dim: int = 0,
 ):
     logits = jnp.log(p)
     # Generate Gumbel noise
-    gumbels = -jnp.log( # TODO: note torch.legacy_contiguous_format
+    gumbels = -jnp.log(  # TODO: note torch.legacy_contiguous_format
         jax.random.exponential(
             prng_key,
             shape=logits.shape,
             dtype=logits.dtype,
         )
-    ) # ~Gumbel(0,1)
+    )  # ~Gumbel(0,1)
     gumbels = (logits + gumbels) / temperature  # ~Gumbel(logits,tau)
     y_soft = nnx.softmax(gumbels, axis=dim)
     return jnp.argmax(y_soft, axis=-1)
@@ -1919,54 +1920,87 @@ class SimNorm(nn.Module):
         return f"SimNorm(dim={self.dim})"
 
 
-class NormedLinear(nn.Linear):
+class NormedLinear(nnx.Linear):
     """
     Linear layer with LayerNorm, activation, and optionally dropout.
     """
 
-    def __init__(self, *args, dropout=0.0, act=None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        rngs: nnx.Rngs,
+        dropout: float = 0.0,
+        act: Callable[..., Any] | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.ln = nn.LayerNorm(self.out_features)
-        if act is None:
-            act = nn.Mish(inplace=False)
-        self.act = act
-        self.dropout = nn.Dropout(dropout, inplace=False) if dropout else None
+        self.ln = nnx.LayerNorm(
+            num_features=self.out_features,
+            rngs=rngs,
+        )
+        self.act = act if act is not None else jax.nn.mish
+        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout else None
 
-    def forward(self, x):
-        x = super().forward(x)
+    @override
+    def __call__(self, x: Array) -> Array:
+        x = super()(x)
         if self.dropout:
             x = self.dropout(x)
         return self.act(self.ln(x))
 
-    def __repr__(self):
-        repr_dropout = f", dropout={self.dropout.p}" if self.dropout else ""
-        return (
-            f"NormedLinear(in_features={self.in_features}, "
-            f"out_features={self.out_features}, "
-            f"bias={self.bias is not None}{repr_dropout}, "
-            f"act={self.act.__class__.__name__})"
-        )
+    # TODO: removable?
+    # def __repr__(self):
+    #     repr_dropout = f", dropout={self.dropout.p}" if self.dropout else ""
+    #     return (
+    #         f"NormedLinear(in_features={self.in_features}, "
+    #         f"out_features={self.out_features}, "
+    #         f"bias={self.bias is not None}{repr_dropout}, "
+    #         f"act={self.act.__class__.__name__})"
+    #     )
 
 
-def mlp(in_dim, mlp_dims, out_dim, act=None, dropout=0.0):
+def mlp(
+    in_dim: int,
+    mlp_dims: list[int] | int,
+    out_dim: int,
+    rngs: nnx.Rngs,
+    act: Callable[..., Any] | None = None,
+    dropout: float = 0.0,
+):
     """
     Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
+
+    Parameters
+    ----------
+    in_dim
+        Dimension of the input layer.
+    mlp_dims
+        Dimensions of the hidden layers. If just one value, there will be 1
+        hidden layer with the given dimension.
+    out_dim
+        Dimension of the output layer.
+    act
+        Activation function for the output layer.
+    dropout
+        Dropout probability used for all hidden layers.
     """
-    if isinstance(mlp_dims, int):
+    if isinstance(mlp_dims, int):  # just one hidden layer
         mlp_dims = [mlp_dims]
     dims = [in_dim] + mlp_dims + [out_dim]
-    mlp = nn.ModuleList()
+    layers: list[nnx.Module] = []
     for i in range(len(dims) - 2):
-        mlp.append(
-            NormedLinear(dims[i], dims[i + 1], dropout=dropout * (i == 0))
+        layers.append(
+            NormedLinear(
+                dims[i], dims[i + 1], rngs=rngs, dropout=dropout * (i == 0)
+            )
         )
-    mlp.append(
-        NormedLinear(dims[-2], dims[-1], act=act)
+    layers.append(
+        NormedLinear(dims[-2], dims[-1], rngs=rngs, act=act)
         if act
-        else nn.Linear(dims[-2], dims[-1])
+        else nnx.Linear(dims[-2], dims[-1], rngs=rngs)
     )
-    return nn.Sequential(*mlp)
+    return nnx.Sequential(*layers)
 
 
 def conv(in_shape, num_channels, act=None):
