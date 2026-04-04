@@ -751,17 +751,24 @@ def two_hot_inv(
     return symexp(x)
 
 
-def gumbel_softmax_sample(p, temperature=1.0, dim=0):
-    logits = p.log()
+def gumbel_softmax_sample(
+    p: ArrayLike,
+    prng_key: ArrayLike, # TODO: PRNGKey
+    temperature: float = 1.0,
+    dim: int = 0,
+):
+    logits = jnp.log(p)
     # Generate Gumbel noise
-    gumbels = (
-        -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format)
-        .exponential_()
-        .log()
-    )  # ~Gumbel(0,1)
+    gumbels = -jnp.log( # TODO: note torch.legacy_contiguous_format
+        jax.random.exponential(
+            prng_key,
+            shape=logits.shape,
+            dtype=logits.dtype,
+        )
+    ) # ~Gumbel(0,1)
     gumbels = (logits + gumbels) / temperature  # ~Gumbel(logits,tau)
-    y_soft = gumbels.softmax(dim)
-    return y_soft.argmax(-1)
+    y_soft = nnx.softmax(gumbels, axis=dim)
+    return jnp.argmax(y_soft, axis=-1)
 
 
 class RunningScale(torch.nn.Module):
