@@ -28,6 +28,7 @@
 # SOFTWARE.
 
 import os
+
 from recordclass import recordclass
 
 os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
@@ -46,18 +47,18 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, override
 
-import jax
-from jax import Array
-import jax.numpy as jnp
-from jax.typing import ArrayLike
-from flax import nnx
 import gymnasium as gym
-from gymnasium.wrappers import NumpyToTorch
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flax import nnx
+from gymnasium.wrappers import NumpyToTorch
+from jax import Array
+from jax.typing import ArrayLike
 from tensordict import from_modules
 from tensordict.nn import TensorDictParams
 from tensordict.tensordict import TensorDict
@@ -68,7 +69,6 @@ from tqdm.rich import trange
 
 from rl_blox.logging.logger import LoggerBase
 from rl_blox.logging.timer import Timer
-
 
 torch.backends.cudnn.benchmark = True
 torch.set_float32_matmul_precision("high")
