@@ -655,23 +655,34 @@ def soft_ce(
     return -jnp.sum(target * pred, axis=-1, keepdims=True)
 
 
-def safe_log_std(x, low, dif):
-    return low + 0.5 * dif * (torch.tanh(x) + 1)
+def safe_log_std(
+    x: ArrayLike,
+    low: ArrayLike,
+    dif: ArrayLike,
+):
+    return low + 0.5 * dif * (jnp.tanh(x) + 1)
 
 
-def gaussian_logprob(eps, log_std):
+def gaussian_logprob(
+    eps: ArrayLike,
+    log_std: ArrayLike,
+):
     """Compute Gaussian log probability."""
-    residual = -0.5 * eps.pow(2) - log_std
+    residual = -0.5 * jnp.pow(eps, 2) - log_std
     log_prob = residual - 0.9189385175704956
-    return log_prob.sum(-1, keepdim=True)
+    return jnp.sum(log_prob, axis=-1, keepdims=True)
 
 
-def squash(mu, pi, log_pi):
+def squash(
+    mu: ArrayLike,
+    pi: ArrayLike,
+    log_pi: ArrayLike,
+):
     """Apply squashing function."""
-    mu = torch.tanh(mu)
-    pi = torch.tanh(pi)
-    squashed_pi = torch.log(F.relu(1 - pi.pow(2)) + 1e-6)
-    log_pi = log_pi - squashed_pi.sum(-1, keepdim=True)
+    mu = jnp.tanh(mu)
+    pi = jnp.tanh(pi)
+    squashed_pi = jnp.log(nnx.relu(1 - jnp.pow(pi, 2)) + 1e-6)
+    log_pi = log_pi - jnp.sum(squashed_pi, axis=-1, keepdims=True)
     return mu, pi, log_pi
 
 
