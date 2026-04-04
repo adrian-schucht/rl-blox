@@ -686,16 +686,6 @@ def squash(
     return mu, pi, log_pi
 
 
-def int_to_one_hot(x, num_classes):
-    """
-    Converts an integer tensor to a one-hot tensor.
-    Supports batched inputs.
-    """
-    one_hot = torch.zeros(*x.shape, num_classes, device=x.device)
-    one_hot.scatter_(-1, x.unsqueeze(-1), 1)
-    return one_hot
-
-
 @jax.jit
 def symlog(x: ArrayLike) -> Array:
     """
