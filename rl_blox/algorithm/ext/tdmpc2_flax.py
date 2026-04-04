@@ -1900,21 +1900,21 @@ class PixelPreprocess(nn.Module):
         return x.div(255.0).sub(0.5)
 
 
-class SimNorm(nn.Module):
+class SimNorm(nnx.Module):
     """Simplicial normalization.
 
     Adapted from https://arxiv.org/abs/2204.00616.
     """
 
-    def __init__(self, cfg: AgentConfig):
+    def __init__(self, dim):
         super().__init__()
-        self.dim = cfg.simnorm_dim
+        self.dim = dim
 
-    def forward(self, x):
+    def forward(self, x: Array) -> Array:
         shp = x.shape
-        x = x.view(*shp[:-1], -1, self.dim)
-        x = F.softmax(x, dim=-1)
-        return x.view(*shp)
+        x = jnp.reshape(x, [*shp[:-1], -1, self.dim])
+        x = nnx.softmax(x, axis=-1)
+        return jnp.reshape(x, shp)
 
     def __repr__(self):
         return f"SimNorm(dim={self.dim})"
