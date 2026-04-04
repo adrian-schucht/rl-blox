@@ -1849,46 +1849,65 @@ class Ensemble(nn.Module):
         return f"Vectorized {len(self)}x " + self._repr
 
 
-class ShiftAug(nn.Module):
+class ShiftAug(nnx.Module):
     """
     Random shift image augmentation.
     Adapted from https://github.com/facebookresearch/drqv2
+
+    TODO: complete port
+
+    Warnings
+    --------
+    This has not been fully ported to JAX/FLAX. Complete port before use!
     """
 
-    def __init__(self, pad=3):
+    def __init__(self, pad: int = 3):
         super().__init__()
         self.pad = pad
-        self.padding = tuple([self.pad] * 4)
+        self.padding = (
+            (self.pad, self.pad),
+        ) * 4  # pad by self.pad on each side of every dimension
+        self.prng_key = None # TODO: inject key
 
-    def forward(self, x):
-        x = x.float()
-        n, _, h, w = x.size()
+    def forward(self, x: Array) -> Array:
+        x = x.astype(jnp.float32)
+        n, _, h, w = x.shape
         assert h == w
-        x = F.pad(x, self.padding, "replicate")
+        x = jnp.pad(x, self.padding, "edge")
         eps = 1.0 / (h + 2 * self.pad)
-        arange = torch.linspace(
-            -1.0 + eps,
-            1.0 - eps,
-            h + 2 * self.pad,
-            device=x.device,
-            dtype=x.dtype,
-        )[:h]
-        arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
-        base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
-        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
-        shift = torch.randint(
-            0,
-            2 * self.pad + 1,
-            size=(n, 1, 1, 2),
-            device=x.device,
+        arange = (
+            jnp.linspace(
+                start=-1.0 + eps,
+                stop=1.0 - eps,
+                num=h + 2 * self.pad,
+                dtype=x.dtype,
+            )
+            .at[:h]
+            .get()
+        )
+        arange = jnp.expand_dims(
+            jnp.expand_dims(arange, 0).repeat(h, axis=1),
+            axis=2,
+        )
+        base_grid = jnp.concat([arange, arange.transpose(1, 0)], axis=2)
+        base_grid = jnp.repeat(
+            jnp.expand_dims(base_grid, axis=0),
+            repeats=n,
+            axis=0,
+        )
+        shift = jax.random.randint(
+            key=self.prng_key,
+            shape=(n, 1, 1, 2),
+            minval=0,
+            maxval=2 * self.pad + 1,
             dtype=x.dtype,
         )
         shift *= 2.0 / (h + 2 * self.pad)
         grid = base_grid + shift
-        return F.grid_sample(x, grid, padding_mode="zeros", align_corners=False)
+        return F.grid_sample(x, grid, padding_mode="zeros", align_corners=False) # TODO
 
 
-class PixelPreprocess(nn.Module):
+class PixelPreprocess(nnx.Module):
     """
     Normalizes pixel observations to [-0.5, 0.5].
     """
@@ -1896,8 +1915,8 @@ class PixelPreprocess(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x):
-        return x.div(255.0).sub(0.5)
+    def forward(self, x: Array) -> Array:
+        return jnp.true_divide(x, 255.0) - 0.5
 
 
 class SimNorm(nnx.Module):
