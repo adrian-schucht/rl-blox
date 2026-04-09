@@ -1845,8 +1845,9 @@ class Ensemble(nn.Module):
             self.params, *args, **kwargs
         )
 
-    def __repr__(self):
-        return f"Vectorized {len(self)}x " + self._repr
+    # TODO: removable?
+    # def __repr__(self):
+    #     return f"Vectorized {len(self)}x " + self._repr
 
 
 class ShiftAug(nnx.Module):
@@ -1935,8 +1936,9 @@ class SimNorm(nnx.Module):
         x = nnx.softmax(x, axis=-1)
         return jnp.reshape(x, shp)
 
-    def __repr__(self):
-        return f"SimNorm(dim={self.dim})"
+    # TODO: removable?
+    # def __repr__(self):
+    #     return f"SimNorm(dim={self.dim})"
 
 
 class NormedLinear(nnx.Linear):
