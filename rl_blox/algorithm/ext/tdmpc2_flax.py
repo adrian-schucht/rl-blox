@@ -1960,13 +1960,13 @@ class NormedLinear(nnx.Linear):
             rngs=rngs,
         )
         self.act = act if act is not None else jax.nn.mish
-        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout else None
+        self.dropout = nnx.Dropout(dropout) if dropout else None
 
     @override
-    def __call__(self, x: Array) -> Array:
+    def __call__(self, x: Array, rngs: nnx.Rngs) -> Array:
         x = super()(x)
         if self.dropout:
-            x = self.dropout(x)
+            x = self.dropout(x, rngs=rngs)
         return self.act(self.ln(x))
 
     # TODO: removable?
@@ -2001,6 +2001,8 @@ def mlp(
         hidden layer with the given dimension.
     out_dim
         Dimension of the output layer.
+    rngs
+        Rngs.
     act
         Activation function for the output layer.
     dropout
