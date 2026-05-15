@@ -27,14 +27,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
 import os
 
 from recordclass import recordclass
 
 os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
 os.environ["LAZY_LEGACY_OP"] = "0"
-os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
-os.environ["TORCH_LOGS"] = "+recompiles"
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -44,34 +44,28 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
-from typing import Any, override
+from typing import Any, override, Literal
 
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import optax.tree
 import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from flax import nnx
-from gymnasium.wrappers import NumpyToTorch
-from jax import Array
+from jax import lax, tree_util, Array
 from jax.typing import ArrayLike
-from tensordict import from_modules
-from tensordict.nn import TensorDictParams
-from tensordict.tensordict import TensorDict
 from termcolor import colored
-from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
-from torchrl.data.replay_buffers.samplers import SliceSampler
 from tqdm.rich import trange
 
 from rl_blox.logging.logger import LoggerBase
 from rl_blox.logging.timer import Timer
-
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
+from rl_blox.blox.ema import EMA
+from rl_blox.blox.losses import mse_loss
+from rl_blox.blox.replay_buffer import SubtrajectoryReplayBuffer
 
 AGENT_CHECKPOINTING_ID = "agent"
 
@@ -754,15 +748,14 @@ def two_hot_inv(
 
 def gumbel_softmax_sample(
     p: ArrayLike,
-    prng_key: ArrayLike,  # TODO: PRNGKey
+    rngs: nnx.Rngs,  # TODO: PRNGKey
     temperature: float = 1.0,
     dim: int = 0,
 ):
     logits = jnp.log(p)
     # Generate Gumbel noise
     gumbels = -jnp.log(  # TODO: note torch.legacy_contiguous_format
-        jax.random.exponential(
-            prng_key,
+        rngs.exponential(
             shape=logits.shape,
             dtype=logits.dtype,
         )
@@ -772,65 +765,72 @@ def gumbel_softmax_sample(
     return jnp.argmax(y_soft, axis=-1)
 
 
-class RunningScale(torch.nn.Module):
+class NonlearnableVariable(nnx.Variable):
+    pass
+
+
+class RunningScale(nnx.Module):
     """Running trimmed scale estimator."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: AgentConfig):
         super().__init__()
         self.cfg = cfg
-        self.value = torch.nn.Buffer(
-            torch.ones(1, dtype=torch.float32, device=torch.device("cuda:0"))
-        )
-        self._percentiles = torch.nn.Buffer(
-            torch.tensor(
-                [5, 95], dtype=torch.float32, device=torch.device("cuda:0")
-            )
-        )
+        self.value = NonlearnableVariable(jnp.array(1.0))
+        self._percentiles = NonlearnableVariable(jnp.array([5, 95]))
 
-    def state_dict(self):
-        return dict(value=self.value, percentiles=self._percentiles)
+    # TODO: removable?
+    # def state_dict(self):
+    #     return dict(value=self.value, percentiles=self._percentiles)
+    #
+    # def load_state_dict(self, state_dict):
+    #     self.value.copy_(state_dict["value"])
+    #     self._percentiles.copy_(state_dict["percentiles"])
 
-    def load_state_dict(self, state_dict):
-        self.value.copy_(state_dict["value"])
-        self._percentiles.copy_(state_dict["percentiles"])
-
-    def _positions(self, x_shape):
+    def _positions(self, x_shape) -> tuple[Array, Array, Array, Array]:
         positions = self._percentiles * (x_shape - 1) / 100
-        floored = torch.floor(positions)
-        ceiled = floored + 1
-        ceiled = torch.where(ceiled > x_shape - 1, x_shape - 1, ceiled)
+        floored = jnp.floor(positions)
+        ceiled = floored + 1.0
+        ceiled = jnp.where(ceiled > x_shape - 1, x_shape - 1, ceiled)
         weight_ceiled = positions - floored
         weight_floored = 1.0 - weight_ceiled
         return (
-            floored.long(),
-            ceiled.long(),
-            weight_floored.unsqueeze(1),
-            weight_ceiled.unsqueeze(1),
+            floored.astype(jnp.int64),
+            ceiled.astype(jnp.int64),
+            jnp.expand_dims(weight_floored, axis=1),
+            jnp.expand_dims(weight_ceiled, axis=1),
         )
 
-    def _percentile(self, x):
+    def _percentile(self, x: Array) -> Array:
         x_dtype, x_shape = x.dtype, x.shape
-        x = x.flatten(1, x.ndim - 1)
-        in_sorted = torch.sort(x, dim=0).values
+        x = jax.vmap(jnp.ravel)(x)
+        # x = x.flatten(1, x.ndim - 1) # NOTE: this was here before
+        in_sorted = jnp.sort(x, axis=0)
         floored, ceiled, weight_floored, weight_ceiled = self._positions(
             x.shape[0]
         )
         d0 = in_sorted[floored] * weight_floored
         d1 = in_sorted[ceiled] * weight_ceiled
-        return (d0 + d1).reshape(-1, *x_shape[1:]).to(x_dtype)
+        return jnp.reshape(d0 + d1, (-1,) + x_shape[1:]).astype(x_dtype)
+        # NOTE: was previously:
+        # return (d0 + d1).reshape(-1, *x_shape[1:]).to(x_dtype)
 
-    def update(self, x):
-        percentiles = self._percentile(x.detach())
-        value = torch.clamp(percentiles[1] - percentiles[0], min=1.0)
-        self.value.data.lerp_(value, self.cfg.tau)
+    def update(self, x: Array):
+        percentiles = self._percentile(x)  # NOTE: previously detach()
+        value = jnp.clip(percentiles[1] - percentiles[0], min=1.0)
+        self.value = jnp.interp(
+            x=self.cfg.tau,
+            xp=jnp.array([0.0, 1.0]),
+            fp=jnp.array([self.value, value]),
+        )
 
-    def forward(self, x, update=False):
+    def __call__(self, x: Array, update=False):
         if update:
             self.update(x)
         return x / self.value
 
-    def __repr__(self):
-        return f"RunningScale(S: {self.value})"
+    # TODO: removable?
+    # def __repr__(self):
+    #     return f"RunningScale(S: {self.value})"
 
 
 def make_dir(dir_path):
@@ -857,38 +857,7 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
         return obs, reward, termination, truncation, info
 
 
-class NumpyToTorchSpaces(gym.Wrapper):
-    """
-    Gym environment wrapper for
-      (1) sampling the env.action_space
-      (2) stepping the environment
-      (3) resetting the environment
-    with torch float32 tensors as result types.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-
-    def sample_action_space(self):
-        return torch.tensor(self.action_space.sample())
-
-    def step(self, action):
-        obs, reward, termination, truncation, info = self.env.step(action)
-        return (
-            torch.tensor(obs, dtype=torch.float32),
-            torch.tensor(reward, dtype=torch.float32),
-            termination,
-            truncation,
-            info,
-        )
-
-    def reset(
-        self, *, seed: int | None = None, options: dict[str, Any] | None = None
-    ):
-        obs, info = self.env.reset(seed=seed, options=options)
-        return torch.tensor(obs, dtype=torch.float32), info
-
-
+# TODO: removable?
 class Buffer:
     """
     Replay buffer for TD-MPC2 training. Based on torchrl.
@@ -898,7 +867,7 @@ class Buffer:
     def __init__(self, cfg: FullTrainingConfig):
         self.cfg = cfg
         self._device = torch.device("cuda:0")
-        self._capacity = min(cfg.buffer_size, cfg.steps)
+        self._capacity = min(cfg.buffer_size, cfg.steps) # transitions
         self._sampler = SliceSampler(
             num_slices=self.cfg.batch_size,
             end_key=None,
@@ -907,7 +876,7 @@ class Buffer:
             strict_length=True,
             cache_values=False,
         )
-        self._batch_size = cfg.batch_size * (cfg.horizon + 1)
+        self._batch_size = cfg.batch_size * (cfg.horizon + 1) # batch: (partial?) trajectories
         self._num_eps = 0
 
     @property
@@ -1013,23 +982,26 @@ class OnlineTrainer:
 
     def __init__(
         self,
-        cfg,
-        env,
-        agent,
-        buffer,
+        cfg: FullTrainingConfig,
+        env: gym.Env[gym.spaces.Box, gym.spaces.Box],
+        agent: TDMPC2,
         logger: LoggerBase | None = None,
         timer: Timer = Timer(),
     ):
         self.cfg = cfg
         self.env = env
         self.agent = agent
-        self.buffer = buffer
+        self.buffer = SubtrajectoryReplayBuffer(
+            buffer_size=min(cfg.buffer_size, cfg.steps),
+            horizon=cfg.horizon,
+        )
         self.logger = logger
         self.timer = timer
-        print("Architecture:", self.agent.model)
+        #print("Architecture:", self.agent.model)
         self._step = 0
         self._ep_idx = 0
         self._start_time = time.time()
+        self._transitions_in_episode = []
 
     def common_metrics(self):
         """Return a dictionary of current metrics."""
@@ -1061,30 +1033,33 @@ class OnlineTrainer:
             episode_success=np.nanmean(ep_successes),
         )
 
-    def to_td(self, obs, action=None, reward=None):
-        """Creates a TensorDict for a new episode."""
-        if isinstance(obs, dict):
-            obs = TensorDict(obs, batch_size=(), device="cpu")
-        else:
-            obs = obs.unsqueeze(0).cpu()
-        if action is None:
-            action = torch.full_like(
-                self.env.sample_action_space(), float("nan")
-            )
-        if reward is None:
-            reward = torch.tensor(float("nan"))
-        td = TensorDict(
-            obs=obs,
-            action=action.unsqueeze(0),
-            reward=reward.unsqueeze(0),
-            batch_size=(1,),
-        )
-        return td
+
+    # TODO: removable?
+    # def to_td(self, obs, action=None, reward=None):
+    #     """Creates a TensorDict for a new episode."""
+    #     if isinstance(obs, dict):
+    #         obs = TensorDict(obs, batch_size=(), device="cpu")
+    #     else:
+    #         obs = obs.unsqueeze(0).cpu()
+    #     if action is None:
+    #         action = torch.full_like(
+    #             self.env.sample_action_space(), float("nan")
+    #         )
+    #     if reward is None:
+    #         reward = torch.tensor(float("nan"))
+    #     td = TensorDict(
+    #         obs=obs,
+    #         action=action.unsqueeze(0),
+    #         reward=reward.unsqueeze(0),
+    #         batch_size=(1,),
+    #     )
+    #     return td
 
     def train(self):
         """Train a TD-MPC2 agent."""
         done, eval_next = True, False
         steps_in_episode = 0
+        episode_reward = 0.0
         progress = trange(
             self._step, self.cfg.steps, disable=not self.cfg.progress_bar
         )
@@ -1106,9 +1081,6 @@ class OnlineTrainer:
                     self.timer.stop("eval")
 
                 if self._step > 0:
-                    episode_reward = torch.tensor(
-                        [td["reward"] for td in self._tds[1:]]
-                    ).sum()
                     episode_success = info["success"]
                     if self.logger is not None:
                         self.logger.record_stat("return", value=episode_reward)
@@ -1118,30 +1090,39 @@ class OnlineTrainer:
                         self.logger.stop_episode(steps_in_episode)
 
                     steps_in_episode = 0
-
-                    self._ep_idx = self.buffer.add(torch.cat(self._tds))
+                    episode_reward = 0.0
+                    self._ep_idx += 1
 
                 if self.logger is not None:
                     self.logger.start_new_episode()
 
                 obs, _ = self.env.reset()
-                self._tds = [self.to_td(obs)]
 
             # Collect experience
             if self._step > self.cfg.seed_steps:
                 self.timer.start("agent_act")
-                action = self.agent.act(obs, t0=len(self._tds) == 1)
+                t0 = (steps_in_episode == 0)
+                action = self.agent.act(obs, t0=t0)
                 self.timer.stop("agent_act")
             else:
                 self.timer.start("env_sample_action_space")
-                action = self.env.sample_action_space()
+                action = self.env.action_space.sample() # TODO
                 self.timer.stop("env_sample_action_space")
+            prev_obs = obs
             self.timer.start("env_step")
             obs, reward, termination, truncation, info = self.env.step(action)
             self.timer.stop("env_step")
             done = termination or truncation
-            self._tds.append(self.to_td(obs, action, reward))
+            _ = self.buffer.add_sample(
+                observation=prev_obs,
+                action=action,
+                reward=reward,
+                next_observation=obs, # TODO: removable? Was not here in original impl
+                terminated=termination,
+                truncated=truncation,
+            )
             steps_in_episode += 1
+            episode_reward += reward
 
             # Update agent
             if self._step >= self.cfg.seed_steps:
@@ -1170,137 +1151,240 @@ class OnlineTrainer:
             self.logger.stop_episode(steps_in_episode)
 
 
-class TDMPC2(torch.nn.Module):
+class TDMPC2(nnx.Module):
     """
     TD-MPC2 agent. Implements training + inference.
     Can be used for both single-task and multi-task experiments,
     and supports both state and pixel observations.
     """
 
-    def __init__(self, cfg: AgentConfig):
-        super().__init__()
+    @staticmethod
+    def from_config(cfg: AgentConfig, rng_seed: int):
+        rngs = nnx.Rngs(rng_seed)
+        np_rng = np.random.default_rng(rng_seed)
+        model = WorldModel(cfg, rngs)
+        # TODO: Ensure model._pi is actually masked out by this.
+        model_optim = nnx.Optimizer(
+            model,
+            optax.adam(
+                learning_rate=cfg.lr * cfg.enc_lr_scale
+            ),
+            wrt=nnx.Param,
+        )
+        print("ATTENTION: Correct Optimizer!!!")
+        # model_optim = nnx.Optimizer(
+        #     model,
+        #     optax.chain(
+        #         optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+        #         optax.partition(
+        #             {
+        #                 "_encoder": optax.adam(
+        #                     learning_rate=cfg.lr * cfg.enc_lr_scale
+        #                 ),
+        #                 "_dynamics": optax.adam(learning_rate=cfg.lr),
+        #                 "_reward": optax.adam(learning_rate=cfg.lr),
+        #                 "_Qs": optax.adam(learning_rate=cfg.lr),
+        #             },
+        #             param_labels=("_encoder", "_dynamics", "_reward", "_Qs"),
+        #         ),
+        #     ),
+        #     wrt=nnx.Param,
+        # )
+        # TODO: removable? / why []?
+        # optim = torch.optim.Adam(
+        #     [
+        #         {
+        #             "params": model._encoder.parameters(),
+        #             "lr": cfg.lr * cfg.enc_lr_scale,
+        #         },
+        #         {"params": model._dynamics.parameters()},
+        #         {"params": model._reward.parameters()},
+        #         {"params": model._Qs.parameters()},
+        #         {"params": []},
+        #     ],
+        #     lr=cfg.lr,
+        #     capturable=True,
+        # )
+        pi_optim = nnx.Optimizer(
+            model._pi,
+            optax.chain(
+                optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+                optax.adam(
+                    learning_rate=cfg.lr,
+                    eps=1e-5,
+                ),
+            ),
+            wrt=nnx.Param,
+        )
+        model.eval()
+        scale = RunningScale(cfg)
+        discount = TDMPC2._get_discount(cfg.episode_length, cfg)
+        _prev_mean = NonlearnableVariable(
+            jnp.zeros(shape=(cfg.horizon, cfg.action_dim))
+        )
+        return TDMPC2(
+            model,
+            model_optim,
+            pi_optim,
+            scale,
+            _prev_mean,
+            cfg,
+            discount,
+            rngs,
+            np_rng,
+        )
+
+    def __init__(
+        self,
+        model: WorldModel,
+        model_optim: nnx.Optimizer,
+        pi_optim: nnx.Optimizer,
+        scale: RunningScale,
+        _prev_mean: NonlearnableVariable,
+        cfg: AgentConfig,
+        discount: Array,
+        rngs: nnx.Rngs,
+        np_rng: np.random.Generator,
+    ):
         self.cfg = cfg
-        self.device = torch.device("cuda:0")
-        self.model = WorldModel(cfg).to(self.device)
-        self.optim = torch.optim.Adam(
-            [
-                {
-                    "params": self.model._encoder.parameters(),
-                    "lr": self.cfg.lr * self.cfg.enc_lr_scale,
-                },
-                {"params": self.model._dynamics.parameters()},
-                {"params": self.model._reward.parameters()},
-                {"params": self.model._Qs.parameters()},
-                {"params": []},
-            ],
-            lr=self.cfg.lr,
-            capturable=True,
-        )
-        self.pi_optim = torch.optim.Adam(
-            self.model._pi.parameters(),
-            lr=self.cfg.lr,
-            eps=1e-5,
-            capturable=True,
-        )
-        self.model.eval()
-        self.scale = RunningScale(cfg)
-        self.discount = self._get_discount(cfg.episode_length)
-        self._prev_mean = torch.nn.Buffer(
-            torch.zeros(
-                self.cfg.horizon, self.cfg.action_dim, device=self.device
-            )
-        )
-        if cfg.compile:
-            print("Compiling update function with torch.compile...")
-            self._update = torch.compile(self._update, mode="reduce-overhead")
+        self.model = model
+        self.model_optim = model_optim
+        self.pi_optim = pi_optim
+        self.scale = scale
+        self.discount = discount
+        self._prev_mean = _prev_mean
+        self._rngs = rngs
+        self._np_rng = np_rng
 
-    @property
-    def plan(self):
-        _plan_val = getattr(self, "_plan_val", None)
-        if _plan_val is not None:
-            return _plan_val
-        if self.cfg.compile:
-            plan = torch.compile(self._plan, mode="reduce-overhead")
-        else:
-            plan = self._plan
-        self._plan_val = plan
-        return self._plan_val
+    def _tree_flatten(self):
+        # dynamic
+        children = (
+            self.model,
+            self.model_optim,
+            self.pi_optim,
+            self.scale,
+            self._prev_mean,
+        )
+        # static
+        aux_data = {
+            "cfg": self.cfg,
+            "discount": self.discount,
+        }
+        return children, aux_data
 
-    def _get_discount(self, episode_length):
-        """
-        Returns discount factor for a given episode length.
+    def _tree_unflatten(cls, aux_data, children):
+        return cls(*children, **aux_data)
+
+    @staticmethod
+    def _get_discount(episode_length: int, cfg: AgentConfig) -> float:
+        """Returns the discount factor for a given episode length.
+
         Simple heuristic that scales discount linearly with episode length.
-        Default values should work well for most tasks, but can be changed as needed.
+        Default values should work well for most tasks, but can be changed
+        as needed.
 
-        Args:
-                episode_length (int): Length of the episode. Assumes episodes are of fixed length.
+        Args
+        ----
+        episode_length
+            Length of the episode. Assumes episodes are of fixed length.
 
-        Returns:
-                float: Discount factor for the task.
+        cfg
+            AgentConfig used for its discount information.
+
+        Returns
+        -------
+        float
+            Discount factor for the task.
         """
-        frac = episode_length / self.cfg.discount_denom
+        frac = episode_length / cfg.discount_denom
         return min(
-            max((frac - 1) / (frac), self.cfg.discount_min),
-            self.cfg.discount_max,
+            max(
+                (frac - 1) / (frac),
+                cfg.discount_min,
+            ),
+            cfg.discount_max,
         )
 
-    def save(self, fp):
-        """
-        Save state dict of the agent to filepath.
+    # TODO: removable?
+    # def save(self, fp: str):
+    #     """
+    #     Save state dict of the agent to filepath.
+    #
+    #     Args
+    #     ----
+    #     fp
+    #         Filepath to save state dict to.
+    #     """
+    #     torch.save({"model": self.model.state_dict()}, fp)
+    #
+    # def load(self, fp):
+    #     """
+    #     Load a saved state dict from filepath (or dictionary) into current agent.
+    #
+    #     Args:
+    #             fp (str or dict): Filepath or state dict to load.
+    #     """
+    #     if isinstance(fp, dict):
+    #         state_dict = fp
+    #     else:
+    #         state_dict = torch.load(
+    #             fp, map_location=torch.get_default_device(), weights_only=False
+    #         )
+    #     state_dict = (
+    #         state_dict["model"] if "model" in state_dict else state_dict
+    #     )
+    #     state_dict = api_model_conversion(self.model.state_dict(), state_dict)
+    #     self.model.load_state_dict(state_dict)
+    #     return
 
-        Args:
-                fp (str): Filepath to save state dict to.
-        """
-        torch.save({"model": self.model.state_dict()}, fp)
+    # TODO: lax.stop_gradient() on call
+    # @torch.no_grad()
+    @partial(jax.jit, static_argnames=["eval_mode", "task"])
+    def act(
+        self,
+        obs: ArrayLike,
+        rngs: nnx.Rngs,
+        t0: bool = False,
+        eval_mode: bool = False,
+        task: int | Array | None = None,
+    ) -> Array:
+        """Select an action by planning in the latent space of the world model.
 
-    def load(self, fp):
-        """
-        Load a saved state dict from filepath (or dictionary) into current agent.
+        Parameters
+        ----------
+        obs
+            Observation from the environment.
+        t0
+            Whether this is the first observation in the episode.
+        eval_mode
+            Whether to use the mean of the action distribution.
+        task
+            Task index (only used for multi-task experiments).
 
-        Args:
-                fp (str or dict): Filepath or state dict to load.
+        Returns
+        -------
+        torch.Tensor
+            Action to take in the environment.
         """
-        if isinstance(fp, dict):
-            state_dict = fp
-        else:
-            state_dict = torch.load(
-                fp, map_location=torch.get_default_device(), weights_only=False
-            )
-        state_dict = (
-            state_dict["model"] if "model" in state_dict else state_dict
-        )
-        state_dict = api_model_conversion(self.model.state_dict(), state_dict)
-        self.model.load_state_dict(state_dict)
-        return
-
-    @torch.no_grad()
-    def act(self, obs, t0=False, eval_mode=False, task=None):
-        """
-        Select an action by planning in the latent space of the world model.
-
-        Args:
-                obs (torch.Tensor): Observation from the environment.
-                t0 (bool): Whether this is the first observation in the episode.
-                eval_mode (bool): Whether to use the mean of the action distribution.
-                task (int): Task index (only used for multi-task experiments).
-
-        Returns:
-                torch.Tensor: Action to take in the environment.
-        """
-        obs = obs.to(self.device, non_blocking=True).unsqueeze(0)
+        obs = jnp.expand_dims(obs, axis=0)
         if task is not None:
-            task = torch.tensor([task], device=self.device)
+            task = jnp.array([task])
         if self.cfg.mpc:
-            return self.plan(obs, t0=t0, eval_mode=eval_mode, task=task).cpu()
+            return self._plan(obs, t0=t0, eval_mode=eval_mode, task=task)
         z = self.model.encode(obs, task)
-        action, info = self.model.pi(z, task)
+        action, info = self.model.pi(z, task, rngs)
         if eval_mode:
             action = info["mean"]
-        return action[0].cpu()
+        return action.at[0].get()
 
-    @torch.no_grad()
+    # TODO: removable?
+    # @torch.no_grad()
     def _estimate_value(self, z, actions, task):
-        """Estimate value of a trajectory starting at latent state z and executing given actions."""
+        """Estimate value of a trajectory starting at latent state z and
+        executing given actions.
+
+        (ll. 5-9, Algorithm 1, TD-MPC (inference), [2]_)
+        """
         G, discount = 0, 1
         for t in range(self.cfg.horizon):
             reward = two_hot_inv(
@@ -1314,204 +1398,320 @@ class TDMPC2(torch.nn.Module):
             discount_update = self.discount
             discount = discount * discount_update
         action, _ = self.model.pi(z, task)
-        return G + discount * self.model.Q(z, action, task, return_type="avg")
+        return G + discount * self.model.Q(z, action, rngs=rngs, return_type="avg")
 
-    @torch.no_grad()
-    def _plan(self, obs, t0=False, eval_mode=False, task=None):
+    # TODO: lax.stop_gradient() on call
+    # @torch.no_grad()
+    @partial(jax.jit, static_argnames=["eval_mode", "task"])
+    def _plan(
+        self,
+        obs: Array,
+        rngs: nnx.Rngs,
+        t0: bool = False,
+        eval_mode: bool = False,
+        task: Array | None = None,
+    ):
+        """Plan a sequence of actions using the learned world model.
+
+        Parameters
+        ----------
+        obs
+            State whose latent representation to plan from.
+        t0
+            Whether this is the first observation in the episode.
+        eval_mode
+            Whether to use the mean of the action distribution.
+        task
+            Task index (only used for multi-task experiments).
+
+        Returns
+        -------
+        Array
+            Action to take in the environment.
         """
-        Plan a sequence of actions using the learned world model.
-
-        Args:
-                z (torch.Tensor): Latent state from which to plan.
-                t0 (bool): Whether this is the first observation in the episode.
-                eval_mode (bool): Whether to use the mean of the action distribution.
-                task (Torch.Tensor): Task index (only used for multi-task experiments).
-
-        Returns:
-                torch.Tensor: Action to take in the environment.
-        """
-        # Sample policy trajectories
+        # Sample policy trajectories.
+        # (l. 4, Algorithm 1, TD-MPC (inference), [2]_)
         z = self.model.encode(obs, task)
         if self.cfg.num_pi_trajs > 0:
-            pi_actions = torch.empty(
-                self.cfg.horizon,
-                self.cfg.num_pi_trajs,
-                self.cfg.action_dim,
-                device=self.device,
+            pi_actions = jnp.empty(
+                shape=(
+                    self.cfg.horizon,
+                    self.cfg.num_pi_trajs,
+                    self.cfg.action_dim,
+                )
             )
-            _z = z.repeat(self.cfg.num_pi_trajs, 1)
+            _z = jnp.repeat(
+                jnp.expand_dims(z, 0),
+                repeats=self.cfg.num_pi_trajs,
+                axis=0,
+            )
+            # NOTE: before this:
+            #_z = z.repeat(self.cfg.num_pi_trajs, 1)
             for t in range(self.cfg.horizon - 1):
-                pi_actions[t], _ = self.model.pi(_z, task)
+                action, _ = self.model.pi(_z, task)
+                pi_actions = pi_actions.at[t].set(action)
                 _z = self.model.next(_z, pi_actions[t], task)
-            pi_actions[-1], _ = self.model.pi(_z, task)
+            action, _ = self.model.pi(_z, task)
+            pi_actions[-1] = action
 
         # Initialize state and parameters
-        z = z.repeat(self.cfg.num_samples, 1)
-        mean = torch.zeros(
-            self.cfg.horizon, self.cfg.action_dim, device=self.device
+        z = jnp.repeat(
+            jnp.expand_dims(z, 0),
+            repeats=self.cfg.num_samples,
+            axis=0,
         )
-        std = torch.full(
+        # NOTE: before this:
+        # z = z.repeat(self.cfg.num_samples, 1)
+        mean = jnp.zeros(
+            (self.cfg.horizon, self.cfg.action_dim)
+        )
+        std = jnp.full(
             (self.cfg.horizon, self.cfg.action_dim),
-            self.cfg.max_std,
-            dtype=torch.float,
-            device=self.device,
+            fill_value=self.cfg.max_std,
+            dtype=jnp.float_,
         )
-        if not t0:
-            mean[:-1] = self._prev_mean[1:]
-        actions = torch.empty(
-            self.cfg.horizon,
-            self.cfg.num_samples,
-            self.cfg.action_dim,
-            device=self.device,
+        mean = mean.at[:-1].set(
+            lax.cond(
+                t0,
+                lambda a: a[0],
+                lambda a: a[1],
+                (mean.at[:-1].get(), self._prev_mean.at[1:].get()),
+            )
+        )
+        actions = jnp.empty(
+            shape=(
+                self.cfg.horizon,
+                self.cfg.num_samples,
+                self.cfg.action_dim,
+            ),
         )
         if self.cfg.num_pi_trajs > 0:
-            actions[:, : self.cfg.num_pi_trajs] = pi_actions
+            actions = actions.at[:, : self.cfg.num_pi_trajs].set(pi_actions)
 
         # Iterate MPPI
+        # (ll. 2-10, Algorithm 1, TD-MPC (inference), [2]_)
         for _ in range(self.cfg.iterations):
-            # Sample actions
-            r = torch.randn(
-                self.cfg.horizon,
-                self.cfg.num_samples - self.cfg.num_pi_trajs,
-                self.cfg.action_dim,
-                device=std.device,
+            # Sample MPPI actions
+            # (l. 3, Algorithm 1, TD-MPC (inference), [2]_)
+            r = rngs.normal(
+                shape=(
+                    self.cfg.horizon,
+                    self.cfg.num_samples - self.cfg.num_pi_trajs,
+                    self.cfg.action_dim,
+                )
             )
-            actions_sample = mean.unsqueeze(1) + std.unsqueeze(1) * r
-            actions_sample = actions_sample.clamp(-1, 1)
-            actions[:, self.cfg.num_pi_trajs :] = actions_sample
+            actions_sample = jnp.expand_dims(mean, 1) + jnp.expand_dims(std, 1) * r
+            actions_sample = jnp.clip(actions_sample, -1.0, 1.0)
+            action = actions.at[:, self.cfg.num_pi_trajs:].set(actions_sample)
 
             # Compute elite actions
-            value = self._estimate_value(z, actions, task).nan_to_num(0)
-            elite_idxs = torch.topk(
-                value.squeeze(1), self.cfg.num_elites, dim=0
-            ).indices
-            elite_value, elite_actions = (
-                value[elite_idxs],
-                actions[:, elite_idxs],
+            # TODO: removable?: .nan_to_num(0)
+            value = self._estimate_value(z, actions, task)
+            elite_idxs = jnp.argpartition(
+                value.squeeze(1),
+                self.cfg.num_elites,
+                axis=0,
             )
+            elite_value = value.at[elite_idxs].get()
+            elite_actions = actions.at[:, elite_idxs].get()
 
             # Update parameters
-            max_value = elite_value.max(0).values
-            score = torch.exp(self.cfg.temperature * (elite_value - max_value))
-            score = score / score.sum(0)
-            mean = (score.unsqueeze(0) * elite_actions).sum(dim=1) / (
-                score.sum(0) + 1e-9
+            # (l. 10, Algorithm 1, TD-MPC (inference), [2]_)
+            max_value = jnp.max(elite_value, axis=0)
+            score = jnp.exp(self.cfg.temperature * (elite_value - max_value))
+            score = score / jnp.sum(score, axis=0)
+            mean = (
+                jnp.sum(
+                    jnp.expand_dims(score, 0) * elite_actions,
+                    axis=1,
+                ) / (
+                    jnp.sum(score, 0) + 1e-9
+                )
             )
-            std = (
-                (
-                    score.unsqueeze(0)
-                    * (elite_actions - mean.unsqueeze(1)) ** 2
-                ).sum(dim=1)
-                / (score.sum(0) + 1e-9)
-            ).sqrt()
-            std = std.clamp(self.cfg.min_std, self.cfg.max_std)
+            std = jnp.sqrt(
+                jnp.sum(
+                    (
+                        jnp.expand_dims(score, 0)
+                        * (elite_actions - jnp.expand_dims(mean, 1)) ** 2
+                    ),
+                    axis=1,
+                ) / (jnp.sum(score, 0) + 1e-9)
+            )
+            std = jnp.clip(std, self.cfg.min_std, self.cfg.max_std)
 
         # Select action
+        # (l. 11, Algorithm 1, TD-MPC (inference), [2]_)
         rand_idx = gumbel_softmax_sample(
-            score.squeeze(1)
-        )  # gumbel_softmax_sample is compatible with cuda graphs
-        actions = torch.index_select(elite_actions, 1, rand_idx).squeeze(1)
+            score.squeeze(1),
+            rngs,
+        )
+        actions = jnp.squeeze(jnp.take(elite_actions, rand_idx, axis=1), axis=1)
         a, std = actions[0], std[0]
         if not eval_mode:
-            a = a + std * torch.randn(self.cfg.action_dim, device=std.device)
-        self._prev_mean.copy_(mean)
-        return a.clamp(-1, 1)
+            a = a + std * rngs.normal(self.cfg.action_dim)
+        self._prev_mean = mean
+        return jnp.clip(a, -1.0, 1.0)
 
-    def update_pi(self, zs, task):
+    def _pi_loss(
+        self,
+        zs: Array,
+        task: Array,
+        rngs: nnx.Rngs,
+    ) -> tuple[Array, dict[str, Array]]:
+        """Calculate the loss of the policy on a sequence of latent states.
+
+        (Equation 4, Policy objective, [2]_)
+
+        Parameters
+        ----------
+        zs
+            Sequence of latent states.
+        task
+            Task index (only used for multi-task experiments).
+
+        Returns
+        -------
+        tuple[Array, dict[str, Array]]
+            A pair of (1) the policy loss and (2) the info dict from
+            WorldModel.pi().
         """
-        Update policy using a sequence of latent states.
-
-        Args:
-                zs (torch.Tensor): Sequence of latent states.
-                task (torch.Tensor): Task index (only used for multi-task experiments).
-
-        Returns:
-                float: Loss of the policy update.
-        """
-        action, info = self.model.pi(zs, task)
-        qs = self.model.Q(zs, action, task, return_type="avg", detach=True)
+        action, info = self.model.pi(zs, task, rngs)
+        qs = self.model.Q(zs, action, rngs=rngs, return_type="avg", detach=True)
         self.scale.update(qs[0])
         qs = self.scale(qs)
 
         # Loss is a weighted sum of Q-values
-        rho = torch.pow(self.cfg.rho, torch.arange(len(qs), device=self.device))
+        # (rho is lambda in Equation (4), [2]_)
+        rho = jnp.pow(self.cfg.rho, jnp.arange(len(qs)))
         pi_loss = (
             -(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(
-                dim=(1, 2)
+                axis=(1, 2)
             )
             * rho
         ).mean()
-        pi_loss.backward()
-        pi_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model._pi.parameters(), self.cfg.grad_clip_norm
-        )
-        self.pi_optim.step()
-        self.pi_optim.zero_grad(set_to_none=True)
+        return pi_loss, info
 
-        info = TensorDict(
-            {
-                "policy loss": pi_loss,
-                "policy grad norm": pi_grad_norm,
-                "policy entropy": info["entropy"],
-                "policy scaled entropy": info["scaled_entropy"],
-                "policy scale": self.scale.value,
-            }
+    def update_pi(self, zs: Array, task: Array, rngs: nnx.Rngs):
+        """Update the policy using a sequence of latent states.
+
+        Parameters
+        ----------
+        zs
+            Sequence of latent states.
+        task
+            Task index (only used for multi-task experiments).
+
+        Returns
+        -------
+        float
+            Loss of the policy update.
+
+        See Also
+        --------
+        _pi_loss
+        """
+        (pi_loss, info), pi_loss_grads = nnx.value_and_grad(
+            self._pi_loss,
+            has_aux=True,
+        )(
+            zs, task, rngs
         )
+        # TODO: use optax.tree.norm() on the updates from the orbax optimizer.
+        # For this, the updates have to be made accessible.
+        # Currently, they are hidden behind the facade of nnx.Optimizer.
+        #pi_loss.backward()
+        #pi_grad_norm = torch.nn.utils.clip_grad_norm_(
+        #    self.model._pi.parameters(), self.cfg.grad_clip_norm
+        #)
+        pi_grad_norm = jnp.zeros(0)
+        self.pi_optim.update(self.model.pi, pi_loss_grads)
+        # self.pi_optim.zero_grad(set_to_none=True) # TODO: removable?
+
+        info = {
+            "policy loss": pi_loss,
+            "policy grad norm": pi_grad_norm,
+            "policy entropy": info["entropy"],
+            "policy scaled entropy": info["scaled_entropy"],
+            "policy scale": self.scale.value,
+        }
         return info
 
-    @torch.no_grad()
-    def _td_target(self, next_z, reward, task):
-        """
-        Compute the TD-target from a reward and the observation at the following time step.
+    # TODO: removable?
+    # @torch.no_grad()
+    def _td_target(
+        self,
+        next_z: Array,
+        reward: Array,
+        task: Array,
+        rngs: nnx.Rngs,
+    ) -> Array:
+        """Compute the TD-target from a reward and the observation at
+        the following time step.
 
-        Args:
-                next_z (torch.Tensor): Latent state at the following time step.
-                reward (torch.Tensor): Reward at the current time step.
-                task (torch.Tensor): Task index (only used for multi-task experiments).
+        Arguments
+        ---------
+        next_z
+            Latent state at the following time step.
+        reward
+            Reward at the current time step.
+        task
+            Task index (only used for multi-task experiments).
+        rngs
+            Rngs for invoking the policy.
 
-        Returns:
-                torch.Tensor: TD-target.
+        Returns
+        -------
+        Array
+            TD-target.
         """
-        action, _ = self.model.pi(next_z, task)
+        action, _ = self.model.pi(next_z, task, rngs)
         return reward + self.discount * self.model.Q(
-            next_z, action, task, return_type="min", target=True
+            next_z, action, rngs=rngs, return_type="min", target=True
         )
 
-    def _update(self, obs, action, reward, task=None):
+    def _model_loss(
+        self,
+        obs: Array,
+        action: Array,
+        reward: Array,
+        rngs: nnx.Rngs,
+        task=None,
+    ) -> tuple[Array, dict[str, Array]]:
         # Compute targets
-        with torch.no_grad():
-            next_z = self.model.encode(obs[1:], task)
-            td_targets = self._td_target(next_z, reward, task)
+        next_z = lax.stop_gradient(self.model.encode(obs[1:], task))
+        td_targets = lax.stop_gradient(self._td_target(next_z, reward, task, rngs))
 
         # Prepare for update
         self.model.train()
 
         # Latent rollout
-        zs = torch.empty(
+        zs = jnp.zeros((
             self.cfg.horizon + 1,
             self.cfg.batch_size,
             self.cfg.latent_dim,
-            device=self.device,
-        )
-        z = self.model.encode(obs[0], task)
-        zs[0] = z
+        ))
+        z = self.model.encode(obs.at[0].get(), task)
+        zs = zs.at[0].set(z)
         consistency_loss = 0
-        for t, (_action, _next_z) in enumerate(
-            zip(action.unbind(0), next_z.unbind(0), strict=False)
-        ):
+        for t, (_action, _next_z) in enumerate(zip(
+            jnp.unstack(action, axis=0),
+            jnp.unstack(next_z, axis=0),
+            strict=False,
+        )):
             z = self.model.next(z, _action, task)
             consistency_loss = (
-                consistency_loss + F.mse_loss(z, _next_z) * self.cfg.rho**t
+                consistency_loss + mse_loss(z, _next_z) * self.cfg.rho**t
             )
-            zs[t + 1] = z
+            zs = zs.at[t + 1].set(z)
 
         # Predictions
-        _zs = zs[:-1]
-        qs = self.model.Q(_zs, action, task, return_type="all")
+        _zs = zs.at[:-1].get()
+        qs = self.model.Q(_zs, action, return_type="all")
         reward_preds = self.model.reward(_zs, action, task)
 
         # Compute losses
-        reward_loss, value_loss = 0, 0
+        reward_loss = jnp.float_(0)
+        value_loss = jnp.float_(0)
         for t, (
             rew_pred_unbind,
             rew_unbind,
@@ -1519,10 +1719,10 @@ class TDMPC2(torch.nn.Module):
             qs_unbind,
         ) in enumerate(
             zip(
-                reward_preds.unbind(0),
-                reward.unbind(0),
-                td_targets.unbind(0),
-                qs.unbind(1),
+                jnp.unstack(reward_preds, axis=0),
+                jnp.unstack(reward, axis=0),
+                jnp.unstack(td_targets, axis=0),
+                jnp.unstack(qs, axis=1),
                 strict=False,
             )
         ):
@@ -1538,7 +1738,7 @@ class TDMPC2(torch.nn.Module):
                 ).mean()
                 * self.cfg.rho**t
             )
-            for _, qs_unbind_unbind in enumerate(qs_unbind.unbind(0)):
+            for _, qs_unbind_unbind in enumerate(jnp.unstack(qs_unbind, axis=0)):
                 value_loss = (
                     value_loss
                     + soft_ce(
@@ -1561,33 +1761,79 @@ class TDMPC2(torch.nn.Module):
             + self.cfg.value_coef * value_loss
         )
 
+        info = {
+            "consistency loss": consistency_loss,
+            "reward loss": reward_loss,
+            "q loss": value_loss,
+            "total loss": total_loss,
+        }
+
+        return total_loss, (info, zs)
+
+
+    def _update(
+        self,
+        obs: Array,
+        action: Array,
+        reward: Array,
+        # TODO: removable?
+        rngs: nnx.Rngs,
+        task=None,
+    ):
+
         # Update model
-        total_loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), self.cfg.grad_clip_norm
+        (model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
+            self._model_loss,
+            has_aux=True,
+        )(
+            obs, action, reward, rngs, task
         )
-        self.optim.step()
-        self.optim.zero_grad(set_to_none=True)
+        # TODO: use optax.tree.norm() on the updates from the orbax optimizer.
+        # For this, the updates have to be made accessible.
+        # Currently, they are hidden behind the facade of nnx.Optimizer.
+        # model_loss.backward()
+        # grad_norm = torch.nn.utils.clip_grad_norm_(
+        #     self.model.parameters(), self.cfg.grad_clip_norm
+        # )
+        model_grad_norm = jnp.zeros(0)
+        self.model_optim.update(self.model, model_loss_grads)
+        # self.optim.zero_grad(set_to_none=True) # TODO: removable?
 
         # Update policy
-        pi_info = self.update_pi(zs.detach(), task)
+        # TODO: do something about potentially task==None
+        pi_info = self.update_pi(zs, task, rngs)
 
         # Update target Q-functions
         self.model.soft_update_target_Q()
 
         # Return training statistics
         self.model.eval()
-        info = TensorDict(
-            {
-                "consistency loss": consistency_loss,
-                "reward loss": reward_loss,
-                "q loss": value_loss,
-                "total loss": total_loss,
-                "grad norm": grad_norm,
-            }
-        )
+        info = model_info
+        info["grad norm"] = model_grad_norm
         info.update(pi_info)
-        return info.detach().mean()
+        mean_info = jax.tree.map(lambda val: jnp.mean(val), info)
+        return mean_info
+
+    @staticmethod
+    def _prepare_batch(batch):
+        # shapes are ~(trajectories, transitions, ...)
+        obs, action, reward, next_obs, terminated, truncated = batch
+        # make them ~(transitions, trajectories, ...)
+        # TODO: improve?
+        obs = jnp.swapaxes(obs, 0, 1)
+        action = jnp.swapaxes(action, 0, 1)
+        reward = jnp.swapaxes(reward, 0, 1)
+        next_obs = jnp.swapaxes(next_obs, 0, 1)
+        # terminated + truncated are not needed by TDMPC2._update()
+
+        # TDMPC2._update() just needs a single obs sequence, not both
+        # obs and next_obs, which share all the same observations but
+        # one at the start and one at the end of a trajectory. Thus,
+        # combine them to obtain an obs sequence that is 1 longer than
+        # the trajectory.
+        # shape of obs will then be ~(transitions+1, trajectories, ...)
+        obs = jnp.concatenate([jnp.expand_dims(obs.at[0].get(), 0), next_obs])
+        return obs, action, reward
 
     def update(self, buffer):
         """
@@ -1599,15 +1845,29 @@ class TDMPC2(torch.nn.Module):
         Returns:
                 dict: Dictionary of training statistics.
         """
-        obs, action, reward, task = buffer.sample()
+        batch = buffer.sample_batch(
+            batch_size=self.cfg.batch_size,
+            horizon=self.cfg.horizon,
+            include_intermediate=True,
+            rng=self._np_rng,
+        )
+        prepared_batch = TDMPC2._prepare_batch(batch)
+        obs, action, reward = prepared_batch
+        task = None # TODO: clean up
         kwargs = {}
         if task is not None:
             kwargs["task"] = task
-        torch.compiler.cudagraph_mark_step_begin()
-        return self._update(obs, action, reward, **kwargs)
+        return self._update(obs, action, reward, rngs=self._rngs, **kwargs)
+
+# TODO: removable?
+# tree_util.register_pytree_node(
+#     TDMPC2,
+#     TDMPC2._pytree__flatten,
+#     TDMPC2._pytree__unflatten,
+# )
 
 
-class WorldModel(nn.Module):
+class WorldModel(nnx.Module):
     """TD-MPC2 implicit world model architecture.
 
     The world model consists of
@@ -1620,110 +1880,132 @@ class WorldModel(nn.Module):
     * a Q-function ensemble that predicts the value of a given action
     """
 
-    def __init__(self, cfg: AgentConfig):
+    def __init__(self, cfg: AgentConfig, rngs: nnx.Rngs):
         super().__init__()
         self.cfg = cfg
-        self._encoder = enc(cfg)
+        self._encoder = enc(cfg, rngs)
         self._dynamics = mlp(
-            cfg.latent_dim + cfg.action_dim,
-            2 * [cfg.mlp_dim],
-            cfg.latent_dim,
-            act=SimNorm(cfg),
+            in_dim=cfg.latent_dim + cfg.action_dim,
+            mlp_dims=2 * [cfg.mlp_dim],
+            out_dim=cfg.latent_dim,
+            rngs=rngs,
+            act=SimNorm(cfg.simnorm_dim),
         )
         self._reward = mlp(
-            cfg.latent_dim + cfg.action_dim,
-            2 * [cfg.mlp_dim],
-            max(cfg.num_bins, 1),
+            in_dim=cfg.latent_dim + cfg.action_dim,
+            mlp_dims=2 * [cfg.mlp_dim],
+            out_dim=max(cfg.num_bins, 1),
+            rngs=rngs,
         )
-        self._pi = mlp(cfg.latent_dim, 2 * [cfg.mlp_dim], 2 * cfg.action_dim)
+        self._reward.layers[-1].kernel = jnp.full_like(
+            self._reward.layers[-1].kernel,
+            0.0,
+        )
+        self._pi = mlp(
+            in_dim=cfg.latent_dim,
+            mlp_dims=2 * [cfg.mlp_dim],
+            out_dim=2 * cfg.action_dim,
+            rngs=rngs,
+        )
+        # TODO: Fix Ensemble and following lines (via vmap?)
         self._Qs = Ensemble(
             [
                 mlp(
-                    cfg.latent_dim + cfg.action_dim,
-                    2 * [cfg.mlp_dim],
-                    max(cfg.num_bins, 1),
+                    in_dim=cfg.latent_dim + cfg.action_dim,
+                    mlp_dims=2 * [cfg.mlp_dim],
+                    out_dim=max(cfg.num_bins, 1),
+                    rngs=rngs,
                     dropout=cfg.dropout,
                 )
                 for _ in range(cfg.num_q)
             ]
         )
-        self.apply(weight_init)
-        zero_([self._reward[-1].weight, self._Qs.params["2", "weight"]])
+        # Comes from zero_([..., self._Qs.params["2", "weight"]]):
+        for module in self._Qs.modules:
+            module.layers[-1].kernel = jnp.full_like(
+                module.layers[-1].kernel,
+                0.0
+            )
+        self._detach_Qs = nnx.clone(self._Qs)
+        self._target_Qs = EMA(nnx.clone(self._Qs), update_weight=self.cfg.tau)
 
-        self.register_buffer("log_std_min", torch.tensor(cfg.log_std_min))
-        self.register_buffer(
-            "log_std_dif", torch.tensor(cfg.log_std_max) - self.log_std_min
+        self._log_std_min = NonlearnableVariable(jnp.array(cfg.log_std_min))
+        self._log_std_dif = NonlearnableVariable(
+            jnp.array(cfg.log_std_max) - self._log_std_min
         )
         self.init()
 
     def init(self):
-        # Create params
-        self._detach_Qs_params = TensorDictParams(
-            self._Qs.params.data, no_convert=True
-        )
-        self._target_Qs_params = TensorDictParams(
-            self._Qs.params.data.clone(), no_convert=True
-        )
+        # TODO: removable?
+        # # Create params
+        # self._detach_Qs_params = TensorDictParams(
+        #     self._Qs.params.data, no_convert=True
+        # )
+        # self._target_Qs_params = TensorDictParams(
+        #     self._Qs.params.data.clone(), no_convert=True
+        # )
+        #
+        # # Create modules
+        # with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
+        #     self._detach_Qs = deepcopy(self._Qs)
+        #     self._target_Qs = deepcopy(self._Qs)
+        #
+        # # Assign params to modules
+        # # We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
+        # delattr(self._detach_Qs, "params")
+        # self._detach_Qs.__dict__["params"] = self._detach_Qs_params
+        # delattr(self._target_Qs, "params")
+        # self._target_Qs.__dict__["params"] = self._target_Qs_params
+        pass
 
-        # Create modules
-        with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
-            self._detach_Qs = deepcopy(self._Qs)
-            self._target_Qs = deepcopy(self._Qs)
-
-        # Assign params to modules
-        # We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
-        delattr(self._detach_Qs, "params")
-        self._detach_Qs.__dict__["params"] = self._detach_Qs_params
-        delattr(self._target_Qs, "params")
-        self._target_Qs.__dict__["params"] = self._target_Qs_params
-
-    def __repr__(self):
-        repr = "TD-MPC2 World Model\n"
-        modules = [
-            "Encoder",
-            "Dynamics",
-            "Reward",
-            "Policy prior",
-            "Q-functions",
-        ]
-        for i, m in enumerate(
-            [self._encoder, self._dynamics, self._reward, self._pi, self._Qs]
-        ):
-            repr += f"{modules[i]}: {m}\n"
-        repr += f"Learnable parameters: {self.total_params:,}"
-        return repr
+    # TODO: removable?
+    # def __repr__(self):
+    #     repr = "TD-MPC2 World Model\n"
+    #     modules = [
+    #         "Encoder",
+    #         "Dynamics",
+    #         "Reward",
+    #         "Policy prior",
+    #         "Q-functions",
+    #     ]
+    #     for i, m in enumerate(
+    #         [self._encoder, self._dynamics, self._reward, self._pi, self._Qs]
+    #     ):
+    #         repr += f"{modules[i]}: {m}\n"
+    #     repr += f"Learnable parameters: {self.total_params:,}"
+    #     return repr
 
     @property
     def total_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.init()
-        return self
+    # TODO: removable?
+    # def to(self, *args, **kwargs):
+    #     super().to(*args, **kwargs)
+    #     self.init()
+    #     return self
 
-    def train(self, mode=True):
-        """
-        Overriding `train` method to keep target Q-networks in eval mode.
-        """
-        super().train(mode)
-        self._target_Qs.train(False)
-        return self
+    # TODO
+    @override
+    def train(self, **attributes):
+        """Overriding `train` method to keep target Q-networks in eval mode."""
+        # TODO: Ensure that this behaves the same as torch's train(mode) here.
+        super().train(**attributes)
+        self._target_Qs.eval()
 
     def soft_update_target_Q(self):
-        """
-        Soft-update target Q-networks using Polyak averaging.
-        """
-        self._target_Qs_params.lerp_(self._detach_Qs_params, self.cfg.tau)
+        """Soft-update target Q-networks using Polyak averaging."""
+        self._target_Qs.update(self._detach_Qs)
 
+    # TODO: unused?
     def task_emb(self, x, task):
-        """
-        Continuous task embedding for multi-task experiments.
+        """Continuous task embedding for multi-task experiments.
+
         Retrieves the task embedding for a given task ID `task`
         and concatenates it to the input `x`.
         """
         if isinstance(task, int):
-            task = torch.tensor([task], device=x.device)
+            task = jnp.array([task])
         emb = self._task_emb(task.long())
         if x.ndim == 3:
             emb = emb.unsqueeze(0).repeat(x.shape[0], 1, 1)
@@ -1731,39 +2013,45 @@ class WorldModel(nn.Module):
             emb = emb.repeat(x.shape[0], 1)
         return torch.cat([x, emb], dim=-1)
 
-    def encode(self, obs, task):
-        """
-        Encodes an observation into its latent representation.
+    def encode(self, obs: ArrayLike, task):
+        """Encodes an observation into its latent representation.
+
         This implementation assumes a single state-based observation.
         """
         if self.cfg.obs == "rgb" and obs.ndim == 5:
-            return torch.stack([self._encoder[self.cfg.obs](o) for o in obs])
+            return jnp.stack([self._encoder[self.cfg.obs](o) for o in obs])
         return self._encoder[self.cfg.obs](obs)
 
-    def next(self, z, a, task):
+    def next(self, z: ArrayLike, a: ArrayLike, task) -> Array:
+        """Predicts the next latent state given the current latent state
+        and action.
+
+        Latent dynamics. In the paper: d(z,a,e).
         """
-        Predicts the next latent state given the current latent state and action.
-        """
-        z = torch.cat([z, a], dim=-1)
+        z = jnp.concat([z, a], axis=-1)
         return self._dynamics(z)
 
-    def reward(self, z, a, task):
+    def reward(self, z: ArrayLike, a: ArrayLike, task) -> Array:
+        """Predicts instantaneous (single-step) reward.
+
+        Reward. In the paper: R(z,a,e).
         """
-        Predicts instantaneous (single-step) reward.
-        """
-        z = torch.cat([z, a], dim=-1)
+        z = jnp.concat([z, a], axis=-1)
         return self._reward(z)
 
-    def pi(self, z, task):
-        """
-        Samples an action from the policy prior.
+    def pi(
+        self, z: ArrayLike, task, rngs: nnx.Rngs
+    ) -> tuple[Array, dict[str, Array]]:
+        """Samples an action from the policy prior.
+
         The policy prior is a Gaussian distribution with
         mean and (log) std predicted by a neural network.
         """
         # Gaussian policy prior
-        mean, log_std = self._pi(z).chunk(2, dim=-1)
-        log_std = safe_log_std(log_std, self.log_std_min, self.log_std_dif)
-        eps = torch.randn_like(mean)
+        # NOTE: chunk->split, last chunk would be allowed shorter
+        mean, log_std = jnp.split(self._pi(z), 2, axis=-1)
+        log_std = safe_log_std(log_std, self._log_std_min, self._log_std_dif)
+        eps = rngs.normal(shape=mean.shape, dtype=mean.dtype)
 
         log_prob = gaussian_logprob(eps, log_std)
 
@@ -1772,22 +2060,28 @@ class WorldModel(nn.Module):
         scaled_log_prob = log_prob * size
 
         # Reparameterization trick
-        action = mean + eps * log_std.exp()
+        action = mean + eps * jnp.exp(log_std)
         mean, action, log_prob = squash(mean, action, log_prob)
 
         entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-        info = TensorDict(
-            {
-                "mean": mean,
-                "log_std": log_std,
-                "action_prob": 1.0,
-                "entropy": -log_prob,
-                "scaled_entropy": -log_prob * entropy_scale,
-            }
-        )
+        info = {
+            "mean": mean,
+            "log_std": log_std,
+            "action_prob": jnp.array(1.0),
+            "entropy": -log_prob,
+            "scaled_entropy": -log_prob * entropy_scale,
+        }
         return action, info
 
-    def Q(self, z, a, task, return_type="min", target=False, detach=False):
+    def Q(
+        self,
+        z: Array,
+        a: Array,
+        return_type: Literal["min", "avg", "all"]="min",
+        rngs: nnx.Rngs | None = None,
+        target: bool=False,
+        detach: bool=False
+    ):
         """
         Predict state-action value.
         `return_type` can be one of [`min`, `avg`, `all`]:
@@ -1798,7 +2092,7 @@ class WorldModel(nn.Module):
         """
         assert return_type in {"min", "avg", "all"}
 
-        z = torch.cat([z, a], dim=-1)
+        z = jnp.concatenate([z, a], axis=-1)
         if target:
             qnet = self._target_Qs
         elif detach:
@@ -1810,40 +2104,53 @@ class WorldModel(nn.Module):
         if return_type == "all":
             return out
 
-        qidx = torch.randperm(self.cfg.num_q, device=out.device)[:2]
-        Q = two_hot_inv(
-            out[qidx], self.cfg.vmin, self.cfg.vmax, self.cfg.num_bins
+        if rngs is None:
+            raise RuntimeError(
+                f"Cannot calculate Q: Return type is {return_type},"
+                + " but no nnx.Rngs were given."
+            )
+
+        q_idx = rngs.permutation(self.cfg.num_q)[:2]
+        q_value = two_hot_inv(
+            out.at[q_idx].get(), self.cfg.vmin, self.cfg.vmax, self.cfg.num_bins
         )
         if return_type == "min":
-            return Q.min(0).values
-        return Q.sum(0) / 2
+            return q_value.min(axis=0)
+        return q_value.sum(axis=0) / 2
 
 
-class Ensemble(nn.Module):
+class Ensemble(nnx.Module):
     """
     Vectorized ensemble of modules.
     """
 
-    def __init__(self, modules, **kwargs):
+    def __init__(self, modules: list[nnx.Module]):
         super().__init__()
+        self.modules = modules
         # combine_state_for_ensemble causes graph breaks
-        self.params = from_modules(*modules, as_module=True)
-        with self.params[0].data.to("meta").to_module(modules[0]):
-            self.module = deepcopy(modules[0])
-        self._repr = str(modules[0])
+        # self.params = from_modules(*modules, as_module=True)
+        # with self.params[0].data.to("meta").to_module(modules[0]):
+        #     self.module = deepcopy(modules[0])
+        # self._repr = str(modules[0])
         self._n = len(modules)
+        
+        def forward(module: nnx.Module, x: Array) -> Array:
+            return module(x)
+        self._forward = nnx.vmap(forward, in_axes=(0, None))
 
     def __len__(self):
         return self._n
 
-    def _call(self, params, *args, **kwargs):
-        with params.to_module(self.module):
-            return self.module(*args, **kwargs)
-
-    def forward(self, *args, **kwargs):
-        return torch.vmap(self._call, (0, None), randomness="different")(
-            self.params, *args, **kwargs
-        )
+    # @nnx.vmap(in_axes=(0, None))
+    # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
+    #     return module(x)
+    #
+    def __call__(self, x: Array) -> Array: #, *args, **kwargs): # TODO: removable?
+        # #@nnx.vmap(in_axes=(0, None))
+        # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
+        #     return module(x)
+        # forward = nnx.vmap(_forward, in_axes=(0, None))
+        return self._forward(self.modules, x)
 
     # TODO: removable?
     # def __repr__(self):
@@ -1868,7 +2175,7 @@ class ShiftAug(nnx.Module):
         self.padding = (
             (self.pad, self.pad),
         ) * 4  # pad by self.pad on each side of every dimension
-        self.prng_key = None # TODO: inject key
+        self.prng_key = None  # TODO: inject key
 
     def forward(self, x: Array) -> Array:
         x = x.astype(jnp.float32)
@@ -1905,7 +2212,9 @@ class ShiftAug(nnx.Module):
         )
         shift *= 2.0 / (h + 2 * self.pad)
         grid = base_grid + shift
-        return F.grid_sample(x, grid, padding_mode="zeros", align_corners=False) # TODO
+        return F.grid_sample(
+            x, grid, padding_mode="zeros", align_corners=False
+        )  # TODO
 
 
 class PixelPreprocess(nnx.Module):
@@ -1916,7 +2225,7 @@ class PixelPreprocess(nnx.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x: Array) -> Array:
+    def __call__(self, x: Array) -> Array:
         return jnp.true_divide(x, 255.0) - 0.5
 
 
@@ -1930,7 +2239,7 @@ class SimNorm(nnx.Module):
         super().__init__()
         self.dim = dim
 
-    def forward(self, x: Array) -> Array:
+    def __call__(self, x: Array) -> Array:
         shp = x.shape
         x = jnp.reshape(x, [*shp[:-1], -1, self.dim])
         x = nnx.softmax(x, axis=-1)
@@ -1954,19 +2263,19 @@ class NormedLinear(nnx.Linear):
         act: Callable[..., Any] | None = None,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, rngs=rngs, **kwargs)
         self.ln = nnx.LayerNorm(
             num_features=self.out_features,
             rngs=rngs,
         )
         self.act = act if act is not None else jax.nn.mish
-        self.dropout = nnx.Dropout(dropout) if dropout else None
+        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout else None
 
     @override
-    def __call__(self, x: Array, rngs: nnx.Rngs) -> Array:
-        x = super()(x)
+    def __call__(self, x: Array) -> Array:
+        x = super().__call__(x)
         if self.dropout:
-            x = self.dropout(x, rngs=rngs)
+            x = self.dropout(x)
         return self.act(self.ln(x))
 
     # TODO: removable?
@@ -1987,7 +2296,7 @@ def mlp(
     rngs: nnx.Rngs,
     act: Callable[..., Any] | None = None,
     dropout: float = 0.0,
-):
+) -> nnx.Sequential:
     """
     Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
@@ -2008,6 +2317,8 @@ def mlp(
     dropout
         Dropout probability used for all hidden layers.
     """
+    kernel_init = nnx.initializers.truncated_normal(0.02)
+    bias_init = nnx.initializers.constant(0.0)
     if isinstance(mlp_dims, int):  # just one hidden layer
         mlp_dims = [mlp_dims]
     dims = [in_dim] + mlp_dims + [out_dim]
@@ -2015,15 +2326,35 @@ def mlp(
     for i in range(len(dims) - 2):
         layers.append(
             NormedLinear(
-                dims[i], dims[i + 1], rngs=rngs, dropout=dropout * (i == 0)
+                dims[i],
+                dims[i + 1],
+                rngs=rngs,
+                dropout=dropout * (i == 0),
+                kernel_init=kernel_init,
+                bias_init=bias_init,
             )
         )
     layers.append(
-        NormedLinear(dims[-2], dims[-1], rngs=rngs, act=act)
+        NormedLinear(
+            dims[-2],
+            dims[-1],
+            rngs=rngs,
+            act=act,
+            dropout=0.0,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+        )
         if act
-        else nnx.Linear(dims[-2], dims[-1], rngs=rngs)
+        else nnx.Linear(
+            dims[-2],
+            dims[-1],
+            rngs=rngs,
+            kernel_init=kernel_init,
+            bias_init=bias_init,
+        )
     )
-    return nnx.Sequential(*layers)
+    result = nnx.Sequential(*layers)
+    return result
 
 
 def conv(in_shape, num_channels, act=None):
@@ -2049,25 +2380,31 @@ def conv(in_shape, num_channels, act=None):
     return nn.Sequential(*layers)
 
 
-def enc(cfg: AgentConfig, out={}):
+def enc(cfg: AgentConfig, rngs: nnx.Rngs, out={}):
     """
     Returns a dictionary of encoders for each observation in the dict.
     """
     for k in cfg.obs_shape.keys():
         if k == "state":
             out[k] = mlp(
-                cfg.obs_shape[k][0],
-                max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
-                cfg.latent_dim,
-                act=SimNorm(cfg),
+                in_dim=cfg.obs_shape[k][0],
+                mlp_dims=max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
+                out_dim=cfg.latent_dim,
+                rngs=rngs,
+                act=SimNorm(cfg.simnorm_dim),
             )
         elif k == "rgb":
-            out[k] = conv(cfg.obs_shape[k], cfg.num_channels, act=SimNorm(cfg))
+            raise NotImplementedError(
+                "Encoder for observation type rgb not fully ported to JAX/Flax."
+            )
+            out[k] = conv(
+                cfg.obs_shape[k], cfg.num_channels, act=SimNorm(cfg.simnorm_dim)
+            )
         else:
             raise NotImplementedError(
                 f"Encoder for observation type {k} not implemented."
             )
-    return nn.ModuleDict(out)
+    return out
 
 
 def api_model_conversion(target_state_dict, source_state_dict):
@@ -2126,25 +2463,15 @@ def api_model_conversion(target_state_dict, source_state_dict):
     return source_state_dict
 
 
-def weight_init(m):
-    """Custom weight initialization for TD-MPC2."""
-    if isinstance(m, nn.Linear):
-        nn.init.trunc_normal_(m.weight, std=0.02)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0)
-    elif isinstance(m, nn.Embedding):
-        nn.init.uniform_(m.weight, -0.02, 0.02)
-    elif isinstance(m, nn.ParameterList):
-        for i, p in enumerate(m):
-            if p.dim() == 3:  # Linear
-                nn.init.trunc_normal_(p, std=0.02)  # Weight
-                nn.init.constant_(m[i + 1], 0)  # Bias
-
-
-def zero_(params):
-    """Initialize parameters to zero."""
-    for p in params:
-        p.data.fill_(0)
+# TODO: removable?
+# TODO: initialize ParameterList? Where is this anyway?
+# def weight_init(m):
+#     """Custom weight initialization for TD-MPC2."""
+#     elif isinstance(m, nn.ParameterList):
+#         for i, p in enumerate(m):
+#             if p.dim() == 3:  # Linear
+#                 nn.init.trunc_normal_(p, std=0.02)  # Weight
+#                 nn.init.constant_(m[i + 1], 0)  # Bias
 
 
 def complete_config(
@@ -2189,14 +2516,16 @@ def complete_config(
 
 
 def train_tdmpc2(
-    env: gym.Env,
+    env: gym.Env[gym.spaces.Box, gym.spaces.Box],
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
     rng_seed: int = 1,
     logger: LoggerBase | None = None,
     timer: Timer = Timer(),
 ) -> TDMPC2:
-    """TD-MPC2.
+    """TD-MPC2 from [1]_.
+
+    Note that some parts are not described in [1]_ but only in [2]_.
 
     Parameters
     ----------
@@ -2225,39 +2554,27 @@ def train_tdmpc2(
     .. [1] Hansen, N., Su, H., & Wang, X. (2024). TD-MPC2: Scalable, Robust
        World Models for Continuous Control (arXiv:2310.16828).
        https://doi.org/10.48550/arXiv.2310.16828
+    .. [2] Hansen, N., Wang, X., & Su, H. (2022). Temporal Difference Learning
+       for Model Predictive Control (arXiv:2203.04955).
+       https://doi.org/10.48550/arXiv.2203.04955
     """
-    assert torch.cuda.is_available()
-
     # Check parameters, compute defaults, and create configuration object
     assert training_cfg.steps > 0, "Must train for at least 1 step."
 
     agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
 
-    set_rng_seed(rng_seed)
-
     gym.logger.min_level = 40
     env = DefaultSuccessInfoWrapper(env)
-    env = NumpyToTorch(env)
-    env = NumpyToTorchSpaces(env)
 
     full_cfg = FullTrainingConfig(*agent_cfg, *training_cfg)
 
     trainer = OnlineTrainer(
         cfg=full_cfg,
         env=env,
-        agent=TDMPC2(agent_cfg),
-        buffer=Buffer(full_cfg),
+        agent=TDMPC2.from_config(agent_cfg, rng_seed),
         logger=logger,
         timer=timer,
     )
     trainer.train()
     print("\nTraining completed successfully")
     return trainer.agent
-
-
-def set_rng_seed(seed):
-    """Set seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
