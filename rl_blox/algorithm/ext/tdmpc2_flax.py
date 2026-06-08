@@ -38,14 +38,10 @@ os.environ["LAZY_LEGACY_OP"] = "0"
 import warnings
 
 warnings.filterwarnings("ignore")
-import datetime
-import random
 import time
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from collections.abc import Callable
-from copy import deepcopy
 from functools import partial
-from pathlib import Path
 from typing import Any, override, Literal
 
 import gymnasium as gym
@@ -53,19 +49,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import optax.tree
-import pandas as pd
 from flax import nnx
-from jax import lax, tree_util, Array
+from jax import lax, Array
 from jax.typing import ArrayLike
-from termcolor import colored
 from tqdm.rich import trange
 
 from rl_blox.logging.logger import LoggerBase
 from rl_blox.logging.timer import Timer
-from rl_blox.blox.ema import EMA
 from rl_blox.blox.losses import mse_loss
 from rl_blox.blox.replay_buffer import SubtrajectoryReplayBuffer
+from rl_blox.blox.target_net import soft_target_net_update
 
 AGENT_CHECKPOINTING_ID = "agent"
 
@@ -107,128 +100,6 @@ MODEL_SIZE = {  # parameters (M)
     },
 }
 
-TASK_SET = {
-    "mt30": [
-        # 19 original dmcontrol tasks
-        "walker-stand",
-        "walker-walk",
-        "walker-run",
-        "cheetah-run",
-        "reacher-easy",
-        "reacher-hard",
-        "acrobot-swingup",
-        "pendulum-swingup",
-        "cartpole-balance",
-        "cartpole-balance-sparse",
-        "cartpole-swingup",
-        "cartpole-swingup-sparse",
-        "cup-catch",
-        "finger-spin",
-        "finger-turn-easy",
-        "finger-turn-hard",
-        "fish-swim",
-        "hopper-stand",
-        "hopper-hop",
-        # 11 custom dmcontrol tasks
-        "walker-walk-backwards",
-        "walker-run-backwards",
-        "cheetah-run-backwards",
-        "cheetah-run-front",
-        "cheetah-run-back",
-        "cheetah-jump",
-        "hopper-hop-backwards",
-        "reacher-three-easy",
-        "reacher-three-hard",
-        "cup-spin",
-        "pendulum-spin",
-    ],
-    "mt80": [
-        # 19 original dmcontrol tasks
-        "walker-stand",
-        "walker-walk",
-        "walker-run",
-        "cheetah-run",
-        "reacher-easy",
-        "reacher-hard",
-        "acrobot-swingup",
-        "pendulum-swingup",
-        "cartpole-balance",
-        "cartpole-balance-sparse",
-        "cartpole-swingup",
-        "cartpole-swingup-sparse",
-        "cup-catch",
-        "finger-spin",
-        "finger-turn-easy",
-        "finger-turn-hard",
-        "fish-swim",
-        "hopper-stand",
-        "hopper-hop",
-        # 11 custom dmcontrol tasks
-        "walker-walk-backwards",
-        "walker-run-backwards",
-        "cheetah-run-backwards",
-        "cheetah-run-front",
-        "cheetah-run-back",
-        "cheetah-jump",
-        "hopper-hop-backwards",
-        "reacher-three-easy",
-        "reacher-three-hard",
-        "cup-spin",
-        "pendulum-spin",
-        # meta-world mt50
-        "mw-assembly",
-        "mw-basketball",
-        "mw-button-press-topdown",
-        "mw-button-press-topdown-wall",
-        "mw-button-press",
-        "mw-button-press-wall",
-        "mw-coffee-button",
-        "mw-coffee-pull",
-        "mw-coffee-push",
-        "mw-dial-turn",
-        "mw-disassemble",
-        "mw-door-open",
-        "mw-door-close",
-        "mw-drawer-close",
-        "mw-drawer-open",
-        "mw-faucet-open",
-        "mw-faucet-close",
-        "mw-hammer",
-        "mw-handle-press-side",
-        "mw-handle-press",
-        "mw-handle-pull-side",
-        "mw-handle-pull",
-        "mw-lever-pull",
-        "mw-peg-insert-side",
-        "mw-peg-unplug-side",
-        "mw-pick-out-of-hole",
-        "mw-pick-place",
-        "mw-pick-place-wall",
-        "mw-plate-slide",
-        "mw-plate-slide-side",
-        "mw-plate-slide-back",
-        "mw-plate-slide-back-side",
-        "mw-push-back",
-        "mw-push",
-        "mw-push-wall",
-        "mw-reach",
-        "mw-reach-wall",
-        "mw-shelf-place",
-        "mw-soccer",
-        "mw-stick-push",
-        "mw-stick-pull",
-        "mw-sweep-into",
-        "mw-sweep",
-        "mw-window-open",
-        "mw-window-close",
-        "mw-bin-picking",
-        "mw-box-close",
-        "mw-door-lock",
-        "mw-door-unlock",
-        "mw-hand-insert",
-    ],
-}
-
 CONSOLE_FORMAT = [
     ("iteration", "I", "int"),
     ("episode", "E", "int"),
@@ -247,7 +118,6 @@ CAT_TO_COLOR = {
 AgentConfig = recordclass(
     "AgentConfig",
     [
-        "task",
         "obs",
         "batch_size",
         "reward_coef",
@@ -261,6 +131,7 @@ AgentConfig = recordclass(
         "discount_denom",
         "discount_min",
         "discount_max",
+        "discount",
         "mpc",
         "iterations",
         "num_samples",
@@ -272,6 +143,7 @@ AgentConfig = recordclass(
         "temperature",
         "log_std_min",
         "log_std_max",
+        "log_std_dif",
         "entropy_coef",
         "num_bins",
         "vmin",
@@ -286,7 +158,6 @@ AgentConfig = recordclass(
         "dropout",
         "simnorm_dim",
         "compile",
-        "tasks",
         "bin_size",
         "action_dim",
         "episode_length",
@@ -309,7 +180,6 @@ TrainingConfig = recordclass(
 FullTrainingConfig = recordclass(
     "FullTrainingConfig",
     [  # Fields are specified explicitly to prevent auto code inspection false positives
-        "task",
         "obs",
         "batch_size",
         "reward_coef",
@@ -323,6 +193,7 @@ FullTrainingConfig = recordclass(
         "discount_denom",
         "discount_min",
         "discount_max",
+        "discount",
         "mpc",
         "iterations",
         "num_samples",
@@ -334,6 +205,7 @@ FullTrainingConfig = recordclass(
         "temperature",
         "log_std_min",
         "log_std_max",
+        "log_std_dif",
         "entropy_coef",
         "num_bins",
         "vmin",
@@ -348,7 +220,6 @@ FullTrainingConfig = recordclass(
         "dropout",
         "simnorm_dim",
         "compile",
-        "tasks",
         "bin_size",
         "action_dim",
         "episode_length",
@@ -364,7 +235,6 @@ FullTrainingConfig = recordclass(
 
 
 def make_agent_cfg(
-    task: str,
     obs: str = "state",
     # Planning
     horizon: int = 3,
@@ -388,8 +258,6 @@ def make_agent_cfg(
     num_enc_layers: int = 2,  # additional
     mlp_dim: int = 512,
     latent_dim: int = 512,
-    # task embedding dim: 96
-    # task embedding norm: 1
     # activation: layernorm + mish
     dropout: float = 0.01,
     num_q: int = 5,
@@ -430,8 +298,6 @@ def make_agent_cfg(
 
     Parameters
     ----------
-    task : str
-        Task name.
     obs : str in ["state", "rgb"]
         Observation type.
     batch_size : int
@@ -447,7 +313,7 @@ def make_agent_cfg(
         dynamics are consistent with the encoding of the true successor
         states (which come from the observation of actual dynamics of the
         environment).
-    rho
+    rho # TODO: actually trace-discount parameter?
         ~Discount factor in loss calculations; lambda in the paper. It is a
         "constant coefficient that weighs temporally farther time steps less"
         in loss calculations. Should be in (0, 1].
@@ -574,6 +440,7 @@ def make_agent_cfg(
         temperature=temperature,
         log_std_min=log_std_min,
         log_std_max=log_std_max,
+        log_std_dif=None, # Set during training
         entropy_coef=entropy_coef,
         num_bins=num_bins,
         vmin=vmin,
@@ -588,11 +455,11 @@ def make_agent_cfg(
         dropout=dropout,
         simnorm_dim=simnorm_dim,
         compile=compile,
-        tasks=TASK_SET.get(task, [task]),
         bin_size=None,  # Set during training
         action_dim=None,  # Set during training
         episode_length=None,  # Set during training
         obs_shape=None,  # Set during training
+        discount=None,  # Set during training
     )
 
 
@@ -699,7 +566,6 @@ def symexp(x: ArrayLike) -> Array:
     return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1)
 
 
-# TODO: squeeze x, 1
 @partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
 def two_hot(
     x: ArrayLike,
@@ -714,7 +580,7 @@ def two_hot(
         return jnp.array(x)
     elif num_bins == 1:
         return symlog(x)
-    x = jnp.clip(symlog(x), vmin, vmax)
+    x = jnp.clip(symlog(x), vmin, vmax).squeeze(axis=-1)
     bin_idx = jnp.floor((x - vmin) / bin_size)
     bin_offset = (x - vmin) / bin_size - bin_idx
     soft_two_hot = jnp.zeros((x.shape[0], num_bins), dtype=x.dtype)
@@ -740,15 +606,16 @@ def two_hot_inv(
         return jnp.array(x)
     elif num_bins == 1:
         return symexp(x)
-    x = nnx.softmax(x, axis=-1)
     dreg_bins = jnp.linspace(vmin, vmax, num_bins, dtype=x.dtype)
-    x = jnp.sum(x * dreg_bins, axis=-1)
+    x = nnx.softmax(x, axis=-1)
+    x = jnp.sum(x * dreg_bins, axis=-1, keepdims=True)
+    print(f"{x.shape=}")
     return symexp(x)
 
 
 def gumbel_softmax_sample(
     p: ArrayLike,
-    rngs: nnx.Rngs,  # TODO: PRNGKey
+    rngs: nnx.Rngs,
     temperature: float = 1.0,
     dim: int = 0,
 ):
@@ -776,6 +643,9 @@ class RunningScale(nnx.Module):
         super().__init__()
         self.cfg = cfg
         self.value = NonlearnableVariable(jnp.array(1.0))
+        self.updates = jnp.array(0, dtype=int)
+        self.mean = jnp.array(0)
+        self.std = jnp.array(0)
         self._percentiles = NonlearnableVariable(jnp.array([5, 95]))
 
     # TODO: removable?
@@ -801,7 +671,9 @@ class RunningScale(nnx.Module):
         )
 
     def _percentile(self, x: Array) -> Array:
+        print(f"{x=}")
         x_dtype, x_shape = x.dtype, x.shape
+        print(f"{x_shape=}")
         x = jax.vmap(jnp.ravel)(x)
         # x = x.flatten(1, x.ndim - 1) # NOTE: this was here before
         in_sorted = jnp.sort(x, axis=0)
@@ -815,13 +687,19 @@ class RunningScale(nnx.Module):
         # return (d0 + d1).reshape(-1, *x_shape[1:]).to(x_dtype)
 
     def update(self, x: Array):
+        x = x.squeeze()
         percentiles = self._percentile(x)  # NOTE: previously detach()
         value = jnp.clip(percentiles[1] - percentiles[0], min=1.0)
+        print(f"RunningScale -> update() -> {self.value.shape=}")
+        print(f"RunningScale -> update() -> {value.shape=}")
         self.value = jnp.interp(
             x=self.cfg.tau,
             xp=jnp.array([0.0, 1.0]),
             fp=jnp.array([self.value, value]),
         )
+        self.updates = self.updates + 1
+        self.mean = jnp.mean(x)
+        self.std = jnp.std(x)
 
     def __call__(self, x: Array, update=False):
         if update:
@@ -858,180 +736,27 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
 
 
 # TODO: removable?
-class Buffer:
-    """
-    Replay buffer for TD-MPC2 training. Based on torchrl.
-    Uses CUDA memory if available, and CPU memory otherwise.
-    """
-
-    def __init__(self, cfg: FullTrainingConfig):
-        self.cfg = cfg
-        self._device = torch.device("cuda:0")
-        self._capacity = min(cfg.buffer_size, cfg.steps) # transitions
-        self._sampler = SliceSampler(
-            num_slices=self.cfg.batch_size,
-            end_key=None,
-            traj_key="episode",
-            truncated_key=None,
-            strict_length=True,
-            cache_values=False,
-        )
-        self._batch_size = cfg.batch_size * (cfg.horizon + 1) # batch: (partial?) trajectories
-        self._num_eps = 0
-
-    @property
-    def capacity(self):
-        """Return the capacity of the buffer."""
-        return self._capacity
-
-    @property
-    def num_eps(self):
-        """Return the number of episodes in the buffer."""
-        return self._num_eps
-
-    def _reserve_buffer(self, storage):
-        """
-        Reserve a buffer with the given storage.
-        """
-        return ReplayBuffer(
-            storage=storage,
-            sampler=self._sampler,
-            pin_memory=False,
-            prefetch=0,
-            batch_size=self._batch_size,
-        )
-
-    def _init(self, tds):
-        """Initialize the replay buffer. Use the first episode to estimate storage requirements."""
-        print(f"Buffer capacity: {self._capacity:,}")
-        mem_free, _ = torch.cuda.mem_get_info()
-        bytes_per_step = sum(
-            [
-                (
-                    v.numel() * v.element_size()
-                    if not isinstance(v, TensorDict)
-                    else sum([x.numel() * x.element_size() for x in v.values()])
-                )
-                for v in tds.values()
-            ]
-        ) / len(tds)
-        total_bytes = bytes_per_step * self._capacity
-        print(f"Storage required: {total_bytes / 1e9:.2f} GB")
-        # Heuristic: decide whether to use CUDA or CPU memory
-        storage_device = "cuda:0" if 2.5 * total_bytes < mem_free else "cpu"
-        print(f"Using {storage_device.upper()} memory for storage.")
-        self._storage_device = torch.device(storage_device)
-        return self._reserve_buffer(
-            LazyTensorStorage(self._capacity, device=self._storage_device)
-        )
-
-    def load(self, td):
-        """
-        Load a batch of episodes into the buffer. This is useful for loading data from disk,
-        and is more efficient than adding episodes one by one.
-        """
-        num_new_eps = len(td)
-        episode_idx = torch.arange(
-            self._num_eps, self._num_eps + num_new_eps, dtype=torch.int64
-        )
-        td["episode"] = episode_idx.unsqueeze(-1).expand(
-            -1, td["reward"].shape[1]
-        )
-        if self._num_eps == 0:
-            self._buffer = self._init(td[0])
-        td = td.reshape(td.shape[0] * td.shape[1])
-        self._buffer.extend(td)
-        self._num_eps += num_new_eps
-        return self._num_eps
-
-    def add(self, td):
-        """Add an episode to the buffer."""
-        td["episode"] = torch.full_like(
-            td["reward"], self._num_eps, dtype=torch.int64
-        )
-        if self._num_eps == 0:
-            self._buffer = self._init(td)
-        self._buffer.extend(td)
-        self._num_eps += 1
-        return self._num_eps
-
-    def _prepare_batch(self, td):
-        """
-        Prepare a sampled batch for training (post-processing).
-        Expects `td` to be a TensorDict with batch size TxB.
-        """
-        td = td.select("obs", "action", "reward", "task", strict=False).to(
-            self._device, non_blocking=True
-        )
-        obs = td.get("obs").contiguous()
-        action = td.get("action")[1:].contiguous()
-        reward = td.get("reward")[1:].unsqueeze(-1).contiguous()
-        task = td.get("task", None)
-        if task is not None:
-            task = task[0].contiguous()
-        return obs, action, reward, task
-
-    def sample(self):
-        """Sample a batch of subsequences from the buffer."""
-        td = self._buffer.sample().view(-1, self.cfg.horizon + 1).permute(1, 0)
-        return self._prepare_batch(td)
-
-
-class OnlineTrainer:
-    """Trainer class for single-task online TD-MPC2 training."""
-
-    def __init__(
-        self,
-        cfg: FullTrainingConfig,
-        env: gym.Env[gym.spaces.Box, gym.spaces.Box],
-        agent: TDMPC2,
-        logger: LoggerBase | None = None,
-        timer: Timer = Timer(),
-    ):
-        self.cfg = cfg
-        self.env = env
-        self.agent = agent
-        self.buffer = SubtrajectoryReplayBuffer(
-            buffer_size=min(cfg.buffer_size, cfg.steps),
-            horizon=cfg.horizon,
-        )
-        self.logger = logger
-        self.timer = timer
-        #print("Architecture:", self.agent.model)
-        self._step = 0
-        self._ep_idx = 0
-        self._start_time = time.time()
-        self._transitions_in_episode = []
-
-    def common_metrics(self):
-        """Return a dictionary of current metrics."""
-        return dict(
-            step=self._step,
-            episode=self._ep_idx,
-            total_time=time.time() - self._start_time,
-        )
-
-    def eval(self):
-        """Evaluate a TD-MPC2 agent."""
-        ep_rewards, ep_successes = [], []
-        for i in range(self.cfg.eval_episodes):
-            obs, _ = self.env.reset()
-            done, ep_reward, t = False, 0, 0
-            while not done:
-                torch.compiler.cudagraph_mark_step_begin()
-                action = self.agent.act(obs, t0=t == 0, eval_mode=True)
-                obs, reward, termination, truncation, info = self.env.step(
-                    action
-                )
-                done = termination or truncation
-                ep_reward += reward
-                t += 1
-            ep_rewards.append(ep_reward)
-            ep_successes.append(info["success"])
-        return dict(
-            episode_reward=np.nanmean(ep_rewards),
-            episode_success=np.nanmean(ep_successes),
-        )
+# def eval(self):
+#     """Evaluate a TD-MPC2 agent."""
+#     ep_rewards, ep_successes = [], []
+#     for i in range(self.cfg.eval_episodes):
+#         obs, _ = self.env.reset()
+#         done, ep_reward, t = False, 0, 0
+#         while not done:
+#             torch.compiler.cudagraph_mark_step_begin()
+#             action = self.agent.act(obs, t0=t == 0, eval_mode=True)
+#             obs, reward, termination, truncation, info = self.env.step(
+#                 action
+#             )
+#             done = termination or truncation
+#             ep_reward += reward
+#             t += 1
+#         ep_rewards.append(ep_reward)
+#         ep_successes.append(info["success"])
+#     return dict(
+#         episode_reward=np.nanmean(ep_rewards),
+#         episode_success=np.nanmean(ep_successes),
+#     )
 
 
     # TODO: removable?
@@ -1055,817 +780,820 @@ class OnlineTrainer:
     #     )
     #     return td
 
-    def train(self):
-        """Train a TD-MPC2 agent."""
-        done, eval_next = True, False
-        steps_in_episode = 0
-        episode_reward = 0.0
-        progress = trange(
-            self._step, self.cfg.steps, disable=not self.cfg.progress_bar
+def _train(
+    cfg: FullTrainingConfig,
+    env: gym.Env[gym.spaces.Box, gym.spaces.Box],
+    model: WorldModel,
+    pi: nnx.Module,
+    model_optim: nnx.Optimizer,
+    pi_optim: nnx.Optimizer,
+    rngs: nnx.Rngs,
+    np_rng: np.random.Generator,
+    logger: LoggerBase | None = None,
+    timer: Timer = Timer(),
+):
+    """Train a TD-MPC2 agent."""
+    buffer = SubtrajectoryReplayBuffer(
+        buffer_size=min(cfg.buffer_size, cfg.steps),
+        horizon=cfg.horizon,
+    )
+    scale = RunningScale(cfg)
+    step = 0
+    ep_idx = 0
+    start_time = time.time()
+    transitions_in_episode = []
+    done, eval_next = True, False
+    steps_in_episode = 0
+    episode_reward = 0.0
+    previous_mean = None
+    progress = trange(
+        step, cfg.steps, disable=not cfg.progress_bar
+    )
+
+    timer.start("training")
+    timer.start("seed_acquisition")
+    for step in np.arange(step, cfg.steps + 1):
+        # Evaluate agent periodically
+        if step % cfg.eval_freq == 0:
+            eval_next = False  # FIXME: originally True
+
+        # Reset environment
+        if done:
+            if eval_next:
+                timer.start("eval")
+                eval_metrics = eval()
+                eval_metrics.update(dict(
+                        step=step,
+                        episode=ep_idx,
+                        total_time=time.time()-start_time,
+                ))
+                # TODO: log? evaluate at all?
+                eval_next = False
+                timer.stop("eval")
+
+            if step > 0:
+                episode_success = info["success"]
+                if logger is not None:
+                    logger.record_stat("return", value=episode_reward)
+                    logger.record_stat(
+                        "success", value=episode_success
+                    )
+                    logger.stop_episode(steps_in_episode)
+
+                steps_in_episode = 0
+                episode_reward = 0.0
+                ep_idx += 1
+
+            if logger is not None:
+                logger.start_new_episode()
+
+            obs, _ = env.reset()
+
+        # Collect experience
+        if step > cfg.seed_steps:
+            timer.start("agent_act")
+            t0 = (steps_in_episode == 0)
+            action, previous_mean = act(
+                model=model,
+                pi=pi,
+                obs=obs,
+                previous_mean=previous_mean,
+                rngs=rngs,
+                cfg=cfg,
+                t0=t0,
+            )
+            timer.stop("agent_act")
+        else:
+            timer.start("env_sample_action_space")
+            action = env.action_space.sample() # TODO
+            timer.stop("env_sample_action_space")
+        prev_obs = obs
+        timer.start("env_step")
+        obs, reward, termination, truncation, info = env.step(action)
+        timer.stop("env_step")
+        done = termination or truncation
+        _ = buffer.add_sample(
+            observation=prev_obs,
+            action=action,
+            reward=reward,
+            next_observation=obs, # TODO: removable? Was not here in original impl
+            terminated=termination,
+            truncated=truncation,
         )
-        self.timer.start("training")
-        self.timer.start("seed_acquisition")
-        for self._step in np.arange(self._step, self.cfg.steps + 1):
-            # Evaluate agent periodically
-            if self._step % self.cfg.eval_freq == 0:
-                eval_next = False  # FIXME: originally True
+        steps_in_episode += 1
+        episode_reward += float(reward)
 
-            # Reset environment
-            if done:
-                if eval_next:
-                    self.timer.start("eval")
-                    eval_metrics = self.eval()
-                    eval_metrics.update(self.common_metrics())
-                    # TODO: log? evaluate at all?
-                    eval_next = False
-                    self.timer.stop("eval")
-
-                if self._step > 0:
-                    episode_success = info["success"]
-                    if self.logger is not None:
-                        self.logger.record_stat("return", value=episode_reward)
-                        self.logger.record_stat(
-                            "success", value=episode_success
-                        )
-                        self.logger.stop_episode(steps_in_episode)
-
-                    steps_in_episode = 0
-                    episode_reward = 0.0
-                    self._ep_idx += 1
-
-                if self.logger is not None:
-                    self.logger.start_new_episode()
-
-                obs, _ = self.env.reset()
-
-            # Collect experience
-            if self._step > self.cfg.seed_steps:
-                self.timer.start("agent_act")
-                t0 = (steps_in_episode == 0)
-                action = self.agent.act(obs, t0=t0)
-                self.timer.stop("agent_act")
+        # Update agent
+        if step >= cfg.seed_steps:
+            if step == cfg.seed_steps:
+                num_updates = cfg.seed_steps
+                timer.stop("seed_acquisition")
+                print("Pretraining agent on seed data...")
             else:
-                self.timer.start("env_sample_action_space")
-                action = self.env.action_space.sample() # TODO
-                self.timer.stop("env_sample_action_space")
-            prev_obs = obs
-            self.timer.start("env_step")
-            obs, reward, termination, truncation, info = self.env.step(action)
-            self.timer.stop("env_step")
-            done = termination or truncation
-            _ = self.buffer.add_sample(
-                observation=prev_obs,
-                action=action,
-                reward=reward,
-                next_observation=obs, # TODO: removable? Was not here in original impl
-                terminated=termination,
-                truncated=truncation,
-            )
-            steps_in_episode += 1
-            episode_reward += reward
-
-            # Update agent
-            if self._step >= self.cfg.seed_steps:
-                if self._step == self.cfg.seed_steps:
-                    num_updates = self.cfg.seed_steps
-                    self.timer.stop("seed_acquisition")
-                    print("Pretraining agent on seed data...")
-                else:
-                    num_updates = 1
-                for i in range(num_updates):
-                    self.timer.start("agent_update")
-                    metrics = self.agent.update(self.buffer)
-                    self.timer.stop("agent_update")
-                    progress.update()  # 1 update = 1 step, just not necessarily synchronously
-                    if i == num_updates - 1:
-                        for k, v in metrics.items():
-                            self.logger.record_stat(k, v)
-                self.logger.record_epoch(
-                    AGENT_CHECKPOINTING_ID, self.agent, step=self._step
+                num_updates = 1
+            for i in range(num_updates):
+                timer.start("agent_update")
+                metrics = update(
+                    model=model,
+                    pi=pi,
+                    model_optim=model_optim,
+                    pi_optim=pi_optim,
+                    scale=scale,
+                    buffer=buffer,
+                    rngs=rngs,
+                    np_rng=np_rng,
+                    cfg=cfg,
                 )
+                timer.stop("agent_update")
+                progress.update()  # 1 update = 1 step, just not necessarily synchronously
+                if i == num_updates - 1 and logger is not None:
+                    for k, v in metrics.items():
+                        logger.record_stat(k, v)
+            # TODO fix
+            # if logger is not None:
+            #     logger.record_epoch(
+            #         AGENT_CHECKPOINTING_ID, agent, step=step # TODO: plumb
+            #     )
 
-        # End last (potentially partial) episode # TODO: necessary?
-        if self.logger is not None:
-            self.timer.stop("training")
-            self.timer.log(self.logger)
-            self.logger.stop_episode(steps_in_episode)
-
-
-class TDMPC2(nnx.Module):
-    """
-    TD-MPC2 agent. Implements training + inference.
-    Can be used for both single-task and multi-task experiments,
-    and supports both state and pixel observations.
-    """
-
-    @staticmethod
-    def from_config(cfg: AgentConfig, rng_seed: int):
-        rngs = nnx.Rngs(rng_seed)
-        np_rng = np.random.default_rng(rng_seed)
-        model = WorldModel(cfg, rngs)
-        # TODO: Ensure model._pi is actually masked out by this.
-        model_optim = nnx.Optimizer(
-            model,
-            optax.adam(
-                learning_rate=cfg.lr * cfg.enc_lr_scale
-            ),
-            wrt=nnx.Param,
+    for i in range(1001):
+        if i == 1:
+            timer.start("acting")
+        test_obs = jnp.array(env.observation_space.sample())
+        act(
+            model=model,
+            pi=pi,
+            obs=test_obs,
+            previous_mean=previous_mean,
+            rngs=rngs,
+            cfg=cfg,
+            t0=False,
         )
-        print("ATTENTION: Correct Optimizer!!!")
-        # model_optim = nnx.Optimizer(
-        #     model,
-        #     optax.chain(
-        #         optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
-        #         optax.partition(
-        #             {
-        #                 "_encoder": optax.adam(
-        #                     learning_rate=cfg.lr * cfg.enc_lr_scale
-        #                 ),
-        #                 "_dynamics": optax.adam(learning_rate=cfg.lr),
-        #                 "_reward": optax.adam(learning_rate=cfg.lr),
-        #                 "_Qs": optax.adam(learning_rate=cfg.lr),
-        #             },
-        #             param_labels=("_encoder", "_dynamics", "_reward", "_Qs"),
-        #         ),
-        #     ),
-        #     wrt=nnx.Param,
-        # )
-        # TODO: removable? / why []?
-        # optim = torch.optim.Adam(
-        #     [
-        #         {
-        #             "params": model._encoder.parameters(),
-        #             "lr": cfg.lr * cfg.enc_lr_scale,
-        #         },
-        #         {"params": model._dynamics.parameters()},
-        #         {"params": model._reward.parameters()},
-        #         {"params": model._Qs.parameters()},
-        #         {"params": []},
-        #     ],
-        #     lr=cfg.lr,
-        #     capturable=True,
-        # )
-        pi_optim = nnx.Optimizer(
-            model._pi,
-            optax.chain(
-                optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
-                optax.adam(
-                    learning_rate=cfg.lr,
-                    eps=1e-5,
-                ),
-            ),
-            wrt=nnx.Param,
-        )
-        model.eval()
-        scale = RunningScale(cfg)
-        discount = TDMPC2._get_discount(cfg.episode_length, cfg)
-        _prev_mean = NonlearnableVariable(
-            jnp.zeros(shape=(cfg.horizon, cfg.action_dim))
-        )
-        return TDMPC2(
-            model,
-            model_optim,
-            pi_optim,
-            scale,
-            _prev_mean,
-            cfg,
-            discount,
-            rngs,
-            np_rng,
-        )
+    timer.stop("acting")
 
-    def __init__(
-        self,
-        model: WorldModel,
-        model_optim: nnx.Optimizer,
-        pi_optim: nnx.Optimizer,
-        scale: RunningScale,
-        _prev_mean: NonlearnableVariable,
-        cfg: AgentConfig,
-        discount: Array,
-        rngs: nnx.Rngs,
-        np_rng: np.random.Generator,
-    ):
-        self.cfg = cfg
-        self.model = model
-        self.model_optim = model_optim
-        self.pi_optim = pi_optim
-        self.scale = scale
-        self.discount = discount
-        self._prev_mean = _prev_mean
-        self._rngs = rngs
-        self._np_rng = np_rng
+    # End last (potentially partial) episode # TODO: necessary?
+    if logger is not None:
+        timer.stop("training")
+        timer.log(logger)
+        logger.stop_episode(steps_in_episode)
 
-    def _tree_flatten(self):
-        # dynamic
-        children = (
-            self.model,
-            self.model_optim,
-            self.pi_optim,
-            self.scale,
-            self._prev_mean,
-        )
-        # static
-        aux_data = {
-            "cfg": self.cfg,
-            "discount": self.discount,
-        }
-        return children, aux_data
 
-    def _tree_unflatten(cls, aux_data, children):
-        return cls(*children, **aux_data)
-
-    @staticmethod
-    def _get_discount(episode_length: int, cfg: AgentConfig) -> float:
-        """Returns the discount factor for a given episode length.
-
-        Simple heuristic that scales discount linearly with episode length.
-        Default values should work well for most tasks, but can be changed
-        as needed.
-
-        Args
-        ----
-        episode_length
-            Length of the episode. Assumes episodes are of fixed length.
-
-        cfg
-            AgentConfig used for its discount information.
-
-        Returns
-        -------
-        float
-            Discount factor for the task.
-        """
-        frac = episode_length / cfg.discount_denom
-        return min(
-            max(
-                (frac - 1) / (frac),
-                cfg.discount_min,
-            ),
-            cfg.discount_max,
-        )
-
-    # TODO: removable?
-    # def save(self, fp: str):
-    #     """
-    #     Save state dict of the agent to filepath.
-    #
-    #     Args
-    #     ----
-    #     fp
-    #         Filepath to save state dict to.
-    #     """
-    #     torch.save({"model": self.model.state_dict()}, fp)
-    #
-    # def load(self, fp):
-    #     """
-    #     Load a saved state dict from filepath (or dictionary) into current agent.
-    #
-    #     Args:
-    #             fp (str or dict): Filepath or state dict to load.
-    #     """
-    #     if isinstance(fp, dict):
-    #         state_dict = fp
-    #     else:
-    #         state_dict = torch.load(
-    #             fp, map_location=torch.get_default_device(), weights_only=False
-    #         )
-    #     state_dict = (
-    #         state_dict["model"] if "model" in state_dict else state_dict
-    #     )
-    #     state_dict = api_model_conversion(self.model.state_dict(), state_dict)
-    #     self.model.load_state_dict(state_dict)
-    #     return
-
-    # TODO: lax.stop_gradient() on call
-    # @torch.no_grad()
-    @partial(jax.jit, static_argnames=["eval_mode", "task"])
-    def act(
-        self,
-        obs: ArrayLike,
-        rngs: nnx.Rngs,
-        t0: bool = False,
-        eval_mode: bool = False,
-        task: int | Array | None = None,
-    ) -> Array:
-        """Select an action by planning in the latent space of the world model.
-
-        Parameters
-        ----------
-        obs
-            Observation from the environment.
-        t0
-            Whether this is the first observation in the episode.
-        eval_mode
-            Whether to use the mean of the action distribution.
-        task
-            Task index (only used for multi-task experiments).
-
-        Returns
-        -------
-        torch.Tensor
-            Action to take in the environment.
-        """
-        obs = jnp.expand_dims(obs, axis=0)
-        if task is not None:
-            task = jnp.array([task])
-        if self.cfg.mpc:
-            return self._plan(obs, t0=t0, eval_mode=eval_mode, task=task)
-        z = self.model.encode(obs, task)
-        action, info = self.model.pi(z, task, rngs)
-        if eval_mode:
-            action = info["mean"]
-        return action.at[0].get()
-
-    # TODO: removable?
-    # @torch.no_grad()
-    def _estimate_value(self, z, actions, task):
-        """Estimate value of a trajectory starting at latent state z and
-        executing given actions.
-
-        (ll. 5-9, Algorithm 1, TD-MPC (inference), [2]_)
-        """
-        G, discount = 0, 1
-        for t in range(self.cfg.horizon):
-            reward = two_hot_inv(
-                self.model.reward(z, actions[t], task),
-                self.cfg.vmin,
-                self.cfg.vmax,
-                self.cfg.num_bins,
-            )
-            z = self.model.next(z, actions[t], task)
-            G = G + discount * reward
-            discount_update = self.discount
-            discount = discount * discount_update
-        action, _ = self.model.pi(z, task)
-        return G + discount * self.model.Q(z, action, rngs=rngs, return_type="avg")
-
-    # TODO: lax.stop_gradient() on call
-    # @torch.no_grad()
-    @partial(jax.jit, static_argnames=["eval_mode", "task"])
-    def _plan(
-        self,
-        obs: Array,
-        rngs: nnx.Rngs,
-        t0: bool = False,
-        eval_mode: bool = False,
-        task: Array | None = None,
-    ):
-        """Plan a sequence of actions using the learned world model.
-
-        Parameters
-        ----------
-        obs
-            State whose latent representation to plan from.
-        t0
-            Whether this is the first observation in the episode.
-        eval_mode
-            Whether to use the mean of the action distribution.
-        task
-            Task index (only used for multi-task experiments).
-
-        Returns
-        -------
-        Array
-            Action to take in the environment.
-        """
-        # Sample policy trajectories.
-        # (l. 4, Algorithm 1, TD-MPC (inference), [2]_)
-        z = self.model.encode(obs, task)
-        if self.cfg.num_pi_trajs > 0:
-            pi_actions = jnp.empty(
-                shape=(
-                    self.cfg.horizon,
-                    self.cfg.num_pi_trajs,
-                    self.cfg.action_dim,
-                )
-            )
-            _z = jnp.repeat(
-                jnp.expand_dims(z, 0),
-                repeats=self.cfg.num_pi_trajs,
-                axis=0,
-            )
-            # NOTE: before this:
-            #_z = z.repeat(self.cfg.num_pi_trajs, 1)
-            for t in range(self.cfg.horizon - 1):
-                action, _ = self.model.pi(_z, task)
-                pi_actions = pi_actions.at[t].set(action)
-                _z = self.model.next(_z, pi_actions[t], task)
-            action, _ = self.model.pi(_z, task)
-            pi_actions[-1] = action
-
-        # Initialize state and parameters
-        z = jnp.repeat(
-            jnp.expand_dims(z, 0),
-            repeats=self.cfg.num_samples,
-            axis=0,
-        )
-        # NOTE: before this:
-        # z = z.repeat(self.cfg.num_samples, 1)
-        mean = jnp.zeros(
-            (self.cfg.horizon, self.cfg.action_dim)
-        )
-        std = jnp.full(
-            (self.cfg.horizon, self.cfg.action_dim),
-            fill_value=self.cfg.max_std,
-            dtype=jnp.float_,
-        )
-        mean = mean.at[:-1].set(
-            lax.cond(
-                t0,
-                lambda a: a[0],
-                lambda a: a[1],
-                (mean.at[:-1].get(), self._prev_mean.at[1:].get()),
-            )
-        )
-        actions = jnp.empty(
-            shape=(
-                self.cfg.horizon,
-                self.cfg.num_samples,
-                self.cfg.action_dim,
-            ),
-        )
-        if self.cfg.num_pi_trajs > 0:
-            actions = actions.at[:, : self.cfg.num_pi_trajs].set(pi_actions)
-
-        # Iterate MPPI
-        # (ll. 2-10, Algorithm 1, TD-MPC (inference), [2]_)
-        for _ in range(self.cfg.iterations):
-            # Sample MPPI actions
-            # (l. 3, Algorithm 1, TD-MPC (inference), [2]_)
-            r = rngs.normal(
-                shape=(
-                    self.cfg.horizon,
-                    self.cfg.num_samples - self.cfg.num_pi_trajs,
-                    self.cfg.action_dim,
-                )
-            )
-            actions_sample = jnp.expand_dims(mean, 1) + jnp.expand_dims(std, 1) * r
-            actions_sample = jnp.clip(actions_sample, -1.0, 1.0)
-            action = actions.at[:, self.cfg.num_pi_trajs:].set(actions_sample)
-
-            # Compute elite actions
-            # TODO: removable?: .nan_to_num(0)
-            value = self._estimate_value(z, actions, task)
-            elite_idxs = jnp.argpartition(
-                value.squeeze(1),
-                self.cfg.num_elites,
-                axis=0,
-            )
-            elite_value = value.at[elite_idxs].get()
-            elite_actions = actions.at[:, elite_idxs].get()
-
-            # Update parameters
-            # (l. 10, Algorithm 1, TD-MPC (inference), [2]_)
-            max_value = jnp.max(elite_value, axis=0)
-            score = jnp.exp(self.cfg.temperature * (elite_value - max_value))
-            score = score / jnp.sum(score, axis=0)
-            mean = (
-                jnp.sum(
-                    jnp.expand_dims(score, 0) * elite_actions,
-                    axis=1,
-                ) / (
-                    jnp.sum(score, 0) + 1e-9
-                )
-            )
-            std = jnp.sqrt(
-                jnp.sum(
-                    (
-                        jnp.expand_dims(score, 0)
-                        * (elite_actions - jnp.expand_dims(mean, 1)) ** 2
+def create_tdmpc2_state(cfg: AgentConfig, seed: int = 0):
+    rngs = nnx.Rngs(seed)
+    np_rng = np.random.default_rng(seed)
+    model = WorldModel(cfg, rngs)
+    policy = mlp(
+        in_dim=cfg.latent_dim,
+        mlp_dims=2 * [cfg.mlp_dim],
+        out_dim=2 * cfg.action_dim,
+        rngs=rngs,
+    )
+    labeled_state = nnx.State({
+        "_encoder": "encoder",
+        "_dynamics": "default",
+        "_reward": "default",
+        "_Qs": "default",
+        # TODO: was detach
+        # "_detach_Qs": "off",
+        "_target_Qs": "off",
+    })
+    model_optimizer = nnx.Optimizer(
+        model,
+        optax.chain(
+            optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+            optax.partition(
+                {
+                    "encoder": optax.adam(
+                        learning_rate=cfg.lr * cfg.enc_lr_scale
                     ),
-                    axis=1,
-                ) / (jnp.sum(score, 0) + 1e-9)
-            )
-            std = jnp.clip(std, self.cfg.min_std, self.cfg.max_std)
+                    "default": optax.adam(learning_rate=cfg.lr),
+                    "off": optax.identity(),
+                },
+                labeled_state,
+            ),
+        ),
+        wrt=nnx.Param,
+    )
+    policy_optimizer = nnx.Optimizer(
+        policy,
+        optax.chain(
+            optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+            optax.adam(
+                learning_rate=cfg.lr,
+                eps=1e-5,
+            ),
+        ),
+        wrt=nnx.Param,
+    )
+    model.eval()
+    policy.eval()
+    return namedtuple(
+        "TDMPC2State",
+        [
+            "model",
+            "policy",
+            "model_optimizer",
+            "policy_optimizer",
+        ],
+    )(
+        model,
+        policy,
+        model_optimizer,
+        policy_optimizer,
+    )
 
-        # Select action
-        # (l. 11, Algorithm 1, TD-MPC (inference), [2]_)
-        rand_idx = gumbel_softmax_sample(
-            score.squeeze(1),
-            rngs,
+# TODO: lax.stop_gradient() on call
+# @torch.no_grad()
+@partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
+def act(
+    model: WorldModel,
+    pi: nnx.Module,
+    obs: ArrayLike,
+    previous_mean: Array | None,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+    t0: bool = False,
+    eval_mode: bool = False,
+) -> tuple[Array, Array]:
+    """Select an action by planning in the latent space of the world model.
+
+    Parameters
+    ----------
+    obs
+        Observation from the environment.
+    t0
+        Whether this is the first observation in the episode.
+    eval_mode
+        Whether to use the mean of the action distribution.
+
+    Returns
+    -------
+    torch.Tensor
+        Action to take in the environment.
+    """
+    obs = jnp.expand_dims(obs, axis=0)
+    if cfg.mpc:
+        return _plan(
+            model=model,
+            pi=pi,
+            previous_mean=previous_mean,
+            obs=obs,
+            rngs=rngs,
+            cfg=cfg,
+            t0=t0,
+            eval_mode=eval_mode,
         )
-        actions = jnp.squeeze(jnp.take(elite_actions, rand_idx, axis=1), axis=1)
-        a, std = actions[0], std[0]
-        if not eval_mode:
-            a = a + std * rngs.normal(self.cfg.action_dim)
-        self._prev_mean = mean
-        return jnp.clip(a, -1.0, 1.0)
-
-    def _pi_loss(
-        self,
-        zs: Array,
-        task: Array,
-        rngs: nnx.Rngs,
-    ) -> tuple[Array, dict[str, Array]]:
-        """Calculate the loss of the policy on a sequence of latent states.
-
-        (Equation 4, Policy objective, [2]_)
-
-        Parameters
-        ----------
-        zs
-            Sequence of latent states.
-        task
-            Task index (only used for multi-task experiments).
-
-        Returns
-        -------
-        tuple[Array, dict[str, Array]]
-            A pair of (1) the policy loss and (2) the info dict from
-            WorldModel.pi().
-        """
-        action, info = self.model.pi(zs, task, rngs)
-        qs = self.model.Q(zs, action, rngs=rngs, return_type="avg", detach=True)
-        self.scale.update(qs[0])
-        qs = self.scale(qs)
-
-        # Loss is a weighted sum of Q-values
-        # (rho is lambda in Equation (4), [2]_)
-        rho = jnp.pow(self.cfg.rho, jnp.arange(len(qs)))
-        pi_loss = (
-            -(self.cfg.entropy_coef * info["scaled_entropy"] + qs).mean(
-                axis=(1, 2)
-            )
-            * rho
-        ).mean()
-        return pi_loss, info
-
-    def update_pi(self, zs: Array, task: Array, rngs: nnx.Rngs):
-        """Update the policy using a sequence of latent states.
-
-        Parameters
-        ----------
-        zs
-            Sequence of latent states.
-        task
-            Task index (only used for multi-task experiments).
-
-        Returns
-        -------
-        float
-            Loss of the policy update.
-
-        See Also
-        --------
-        _pi_loss
-        """
-        (pi_loss, info), pi_loss_grads = nnx.value_and_grad(
-            self._pi_loss,
-            has_aux=True,
-        )(
-            zs, task, rngs
-        )
-        # TODO: use optax.tree.norm() on the updates from the orbax optimizer.
-        # For this, the updates have to be made accessible.
-        # Currently, they are hidden behind the facade of nnx.Optimizer.
-        #pi_loss.backward()
-        #pi_grad_norm = torch.nn.utils.clip_grad_norm_(
-        #    self.model._pi.parameters(), self.cfg.grad_clip_norm
-        #)
-        pi_grad_norm = jnp.zeros(0)
-        self.pi_optim.update(self.model.pi, pi_loss_grads)
-        # self.pi_optim.zero_grad(set_to_none=True) # TODO: removable?
-
-        info = {
-            "policy loss": pi_loss,
-            "policy grad norm": pi_grad_norm,
-            "policy entropy": info["entropy"],
-            "policy scaled entropy": info["scaled_entropy"],
-            "policy scale": self.scale.value,
-        }
-        return info
-
-    # TODO: removable?
-    # @torch.no_grad()
-    def _td_target(
-        self,
-        next_z: Array,
-        reward: Array,
-        task: Array,
-        rngs: nnx.Rngs,
-    ) -> Array:
-        """Compute the TD-target from a reward and the observation at
-        the following time step.
-
-        Arguments
-        ---------
-        next_z
-            Latent state at the following time step.
-        reward
-            Reward at the current time step.
-        task
-            Task index (only used for multi-task experiments).
-        rngs
-            Rngs for invoking the policy.
-
-        Returns
-        -------
-        Array
-            TD-target.
-        """
-        action, _ = self.model.pi(next_z, task, rngs)
-        return reward + self.discount * self.model.Q(
-            next_z, action, rngs=rngs, return_type="min", target=True
-        )
-
-    def _model_loss(
-        self,
-        obs: Array,
-        action: Array,
-        reward: Array,
-        rngs: nnx.Rngs,
-        task=None,
-    ) -> tuple[Array, dict[str, Array]]:
-        # Compute targets
-        next_z = lax.stop_gradient(self.model.encode(obs[1:], task))
-        td_targets = lax.stop_gradient(self._td_target(next_z, reward, task, rngs))
-
-        # Prepare for update
-        self.model.train()
-
-        # Latent rollout
-        zs = jnp.zeros((
-            self.cfg.horizon + 1,
-            self.cfg.batch_size,
-            self.cfg.latent_dim,
-        ))
-        z = self.model.encode(obs.at[0].get(), task)
-        zs = zs.at[0].set(z)
-        consistency_loss = 0
-        for t, (_action, _next_z) in enumerate(zip(
-            jnp.unstack(action, axis=0),
-            jnp.unstack(next_z, axis=0),
-            strict=False,
-        )):
-            z = self.model.next(z, _action, task)
-            consistency_loss = (
-                consistency_loss + mse_loss(z, _next_z) * self.cfg.rho**t
-            )
-            zs = zs.at[t + 1].set(z)
-
-        # Predictions
-        _zs = zs.at[:-1].get()
-        qs = self.model.Q(_zs, action, return_type="all")
-        reward_preds = self.model.reward(_zs, action, task)
-
-        # Compute losses
-        reward_loss = jnp.float_(0)
-        value_loss = jnp.float_(0)
-        for t, (
-            rew_pred_unbind,
-            rew_unbind,
-            td_targets_unbind,
-            qs_unbind,
-        ) in enumerate(
-            zip(
-                jnp.unstack(reward_preds, axis=0),
-                jnp.unstack(reward, axis=0),
-                jnp.unstack(td_targets, axis=0),
-                jnp.unstack(qs, axis=1),
-                strict=False,
-            )
-        ):
-            reward_loss = (
-                reward_loss
-                + soft_ce(
-                    rew_pred_unbind,
-                    rew_unbind,
-                    self.cfg.vmin,
-                    self.cfg.vmax,
-                    self.cfg.bin_size,
-                    self.cfg.num_bins,
-                ).mean()
-                * self.cfg.rho**t
-            )
-            for _, qs_unbind_unbind in enumerate(jnp.unstack(qs_unbind, axis=0)):
-                value_loss = (
-                    value_loss
-                    + soft_ce(
-                        qs_unbind_unbind,
-                        td_targets_unbind,
-                        self.cfg.vmin,
-                        self.cfg.vmax,
-                        self.cfg.bin_size,
-                        self.cfg.num_bins,
-                    ).mean()
-                    * self.cfg.rho**t
-                )
-
-        consistency_loss = consistency_loss / self.cfg.horizon
-        reward_loss = reward_loss / self.cfg.horizon
-        value_loss = value_loss / (self.cfg.horizon * self.cfg.num_q)
-        total_loss = (
-            self.cfg.consistency_coef * consistency_loss
-            + self.cfg.reward_coef * reward_loss
-            + self.cfg.value_coef * value_loss
-        )
-
-        info = {
-            "consistency loss": consistency_loss,
-            "reward loss": reward_loss,
-            "q loss": value_loss,
-            "total loss": total_loss,
-        }
-
-        return total_loss, (info, zs)
-
-
-    def _update(
-        self,
-        obs: Array,
-        action: Array,
-        reward: Array,
-        # TODO: removable?
-        rngs: nnx.Rngs,
-        task=None,
-    ):
-
-        # Update model
-        (model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
-            self._model_loss,
-            has_aux=True,
-        )(
-            obs, action, reward, rngs, task
-        )
-        # TODO: use optax.tree.norm() on the updates from the orbax optimizer.
-        # For this, the updates have to be made accessible.
-        # Currently, they are hidden behind the facade of nnx.Optimizer.
-        # model_loss.backward()
-        # grad_norm = torch.nn.utils.clip_grad_norm_(
-        #     self.model.parameters(), self.cfg.grad_clip_norm
-        # )
-        model_grad_norm = jnp.zeros(0)
-        self.model_optim.update(self.model, model_loss_grads)
-        # self.optim.zero_grad(set_to_none=True) # TODO: removable?
-
-        # Update policy
-        # TODO: do something about potentially task==None
-        pi_info = self.update_pi(zs, task, rngs)
-
-        # Update target Q-functions
-        self.model.soft_update_target_Q()
-
-        # Return training statistics
-        self.model.eval()
-        info = model_info
-        info["grad norm"] = model_grad_norm
-        info.update(pi_info)
-        mean_info = jax.tree.map(lambda val: jnp.mean(val), info)
-        return mean_info
-
-    @staticmethod
-    def _prepare_batch(batch):
-        # shapes are ~(trajectories, transitions, ...)
-        obs, action, reward, next_obs, terminated, truncated = batch
-        # make them ~(transitions, trajectories, ...)
-        # TODO: improve?
-        obs = jnp.swapaxes(obs, 0, 1)
-        action = jnp.swapaxes(action, 0, 1)
-        reward = jnp.swapaxes(reward, 0, 1)
-        next_obs = jnp.swapaxes(next_obs, 0, 1)
-        # terminated + truncated are not needed by TDMPC2._update()
-
-        # TDMPC2._update() just needs a single obs sequence, not both
-        # obs and next_obs, which share all the same observations but
-        # one at the start and one at the end of a trajectory. Thus,
-        # combine them to obtain an obs sequence that is 1 longer than
-        # the trajectory.
-        # shape of obs will then be ~(transitions+1, trajectories, ...)
-        obs = jnp.concatenate([jnp.expand_dims(obs.at[0].get(), 0), next_obs])
-        return obs, action, reward
-
-    def update(self, buffer):
-        """
-        Main update function. Corresponds to one iteration of model learning.
-
-        Args:
-                buffer (common.buffer.Buffer): Replay buffer.
-
-        Returns:
-                dict: Dictionary of training statistics.
-        """
-        batch = buffer.sample_batch(
-            batch_size=self.cfg.batch_size,
-            horizon=self.cfg.horizon,
-            include_intermediate=True,
-            rng=self._np_rng,
-        )
-        prepared_batch = TDMPC2._prepare_batch(batch)
-        obs, action, reward = prepared_batch
-        task = None # TODO: clean up
-        kwargs = {}
-        if task is not None:
-            kwargs["task"] = task
-        return self._update(obs, action, reward, rngs=self._rngs, **kwargs)
+    z = model.encode(obs)
+    action, info = sample_pi(pi, z, rngs, cfg)
+    if eval_mode:
+        action = info["mean"]
+    return namedtuple(
+        "PlanningResult",
+        [
+            "action",
+            "mean",
+        ]
+    )(
+        action.at[0].get(),
+        info["mean"],
+    )
 
 # TODO: removable?
-# tree_util.register_pytree_node(
-#     TDMPC2,
-#     TDMPC2._pytree__flatten,
-#     TDMPC2._pytree__unflatten,
-# )
+# @torch.no_grad()
+def _estimate_value(
+    cfg: AgentConfig,
+    model: WorldModel,
+    pi: nnx.Module,
+    z: Array,
+    actions: Array,
+    rngs: nnx.Rngs,
+):
+    """Estimate value of a trajectory starting at latent state z and
+    executing given actions.
 
+    (ll. 5-9, Algorithm 1, TD-MPC (inference), [2]_)
+    """
+    G, discount = 0, 1
+    for t in range(cfg.horizon):
+        reward = two_hot_inv(
+            model.reward(z, actions.at[t].get()),
+            cfg.vmin,
+            cfg.vmax,
+            cfg.num_bins,
+        )
+        z = model.next(z, actions[t])
+        G = G + discount * reward
+        discount_update = cfg.discount
+        discount = discount * discount_update
+    action, _ = sample_pi(pi, z, rngs, cfg)
+    return G + discount * model.Q(z, action, rngs=rngs, return_type="avg") # TODO
+
+# TODO: lax.stop_gradient() on call
+# @torch.no_grad()
+@partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
+def _plan(
+    model: WorldModel,
+    pi: nnx.Module,
+    previous_mean: Array | None,
+    obs: Array,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+    t0: bool = False,
+    eval_mode: bool = False,
+) -> tuple[Array, Array]:
+    """Plan a sequence of actions using the learned world model.
+
+    Parameters
+    ----------
+    obs
+        State whose latent representation to plan from.
+    t0
+        Whether this is the first observation in the episode.
+    eval_mode
+        Whether to use the mean of the action distribution.
+
+    Returns
+    -------
+    Array
+        Action to take in the environment.
+    """
+    if previous_mean is None:
+        previous_mean = jnp.zeros(shape=(cfg.horizon, cfg.action_dim))
+
+    # Sample policy trajectories.
+    # (l. 4, Algorithm 1, TD-MPC (inference), [2]_)
+    z = model.encode(obs)
+    print(f"_plan()/model.encode() -> {z.shape=}")
+    if cfg.num_pi_trajs > 0:
+        pi_actions = jnp.empty(
+            shape=(
+                cfg.horizon,
+                cfg.num_pi_trajs,
+                cfg.action_dim,
+            )
+        )
+        _z = jnp.repeat(
+            z,
+            repeats=cfg.num_pi_trajs,
+            axis=0,
+        )
+        print(f"{_z.shape=}")
+        # NOTE: before this:
+        #_z = z.repeat(self.cfg.num_pi_trajs, 1)
+        for t in range(cfg.horizon - 1):
+            action, _ = sample_pi(pi, _z, rngs, cfg)
+            print(f"{action.shape=}")
+            print(f"{pi_actions.shape=}")
+            pi_actions = pi_actions.at[t].set(action)
+            _z = model.next(_z, pi_actions[t])
+        action, _ = sample_pi(pi, _z, rngs, cfg)
+        pi_actions = pi_actions.at[-1].set(action)
+
+    # Initialize state and parameters
+    z = jnp.repeat(
+        z,
+        repeats=cfg.num_samples,
+        axis=0,
+    )
+    # TODO: correct repeat?
+    # NOTE: before this:
+    # z = z.repeat(self.cfg.num_samples, 1)
+    mean = jnp.zeros(
+        (cfg.horizon, cfg.action_dim)
+    )
+    std = jnp.full(
+        (cfg.horizon, cfg.action_dim),
+        fill_value=cfg.max_std,
+        dtype=jnp.float_,
+    )
+    mean = mean.at[:-1].set(
+        lax.cond(
+            t0,
+            lambda a: a[0],
+            lambda a: a[1],
+            (mean.at[:-1].get(), previous_mean.at[1:].get()),
+        )
+    )
+    actions = jnp.empty(
+        shape=(
+            cfg.horizon,
+            cfg.num_samples,
+            cfg.action_dim,
+        ),
+    )
+    if cfg.num_pi_trajs > 0:
+        actions = actions.at[:, : cfg.num_pi_trajs].set(pi_actions)
+
+    # Iterate MPPI
+    # (ll. 2-10, Algorithm 1, TD-MPC (inference), [2]_)
+    for _ in range(cfg.iterations):
+        # Sample MPPI actions
+        # (l. 3, Algorithm 1, TD-MPC (inference), [2]_)
+        r = rngs.normal(
+            shape=(
+                cfg.horizon,
+                cfg.num_samples - cfg.num_pi_trajs,
+                cfg.action_dim,
+            )
+        )
+        actions_sample = jnp.expand_dims(mean, 1) + jnp.expand_dims(std, 1) * r
+        actions_sample = jnp.clip(actions_sample, -1.0, 1.0)
+        actions = actions.at[:, cfg.num_pi_trajs:].set(actions_sample)
+
+        # Compute elite actions
+        # TODO: removable?: .nan_to_num(0)
+        value = _estimate_value(cfg, model, pi, z, actions, rngs)
+        print(f"_estimate_value -> {value.shape=}")
+        print(f"{value.shape=}")
+        print(f"{value.squeeze(1).shape=}")
+        _, elite_idxs = jax.lax.top_k(
+            value.squeeze(1),
+            cfg.num_elites,
+        )
+        elite_value = value.at[elite_idxs].get()
+        elite_actions = actions.at[:, elite_idxs].get()
+
+        # Update parameters
+        # (l. 10, Algorithm 1, TD-MPC (inference), [2]_)
+        max_value = jnp.max(elite_value, axis=0)
+        score = jnp.exp(cfg.temperature * (elite_value - max_value))
+        score = score / jnp.sum(score, axis=0)
+        mean = (
+            jnp.sum(
+                jnp.expand_dims(score, 0) * elite_actions,
+                axis=1,
+            ) / (
+                jnp.sum(score, 0) + 1e-9
+            )
+        )
+        std = jnp.sqrt(
+            jnp.sum(
+                (
+                    jnp.expand_dims(score, 0)
+                    * (elite_actions - jnp.expand_dims(mean, 1)) ** 2
+                ),
+                axis=1,
+            ) / (jnp.sum(score, 0) + 1e-9)
+        )
+        std = jnp.clip(std, cfg.min_std, cfg.max_std)
+
+    # Select action
+    # (l. 11, Algorithm 1, TD-MPC (inference), [2]_)
+    rand_idx = gumbel_softmax_sample(
+        score.squeeze(1),
+        rngs,
+    )
+    actions = jnp.squeeze(jnp.take(elite_actions, rand_idx, axis=1), axis=1)
+    a, std = actions.at[0].get(), std.at[0].get()
+    if not eval_mode:
+        a = a + std * rngs.normal(cfg.action_dim)
+    return namedtuple(
+        "PlanningResult",
+        [
+            "action",
+            "mean",
+        ]
+    ) (
+        jnp.clip(a, -1.0, 1.0),
+        mean,
+    )
+
+def _pi_loss(
+    pi: nnx.Module,
+    model: WorldModel,
+    scale: RunningScale,
+    zs: Array,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+) -> tuple[Array, dict[str, Array]]:
+    """Calculate the loss of the policy on a sequence of latent states.
+
+    (Equation 4, Policy objective, [2]_)
+
+    Parameters
+    ----------
+    zs
+        Sequence of latent states.
+
+    Returns
+    -------
+    tuple[Array, dict[str, Array]]
+        A pair of (1) the policy loss and (2) the info dict from
+        WorldModel.pi().
+    """
+    action, info = sample_pi(pi, zs, rngs, cfg)
+    # TODO: was detach
+    # TODO: stop grad or something?
+    # qs = model.Q(zs, action, rngs=rngs, return_type="avg", detach=True)
+    qs = model.Q(zs, action, rngs=rngs, return_type="avg")
+    scale.update(qs.at[0].get())
+    qs = scale(qs)
+
+    # Loss is a weighted sum of Q-values
+    # (rho is lambda in Equation (4), [2]_)
+    rho = jnp.pow(cfg.rho, jnp.arange(len(qs)))
+    print(f'{cfg.entropy_coef=}')
+    print(f'{info["scaled_entropy"]=}')
+    print(f'{cfg.entropy_coef * info["scaled_entropy"]=}')
+    print(f'{qs=}')
+    pi_loss = (
+        -(cfg.entropy_coef * info["scaled_entropy"] + qs).mean(
+            axis=(1, 2)
+        )
+        * rho
+    ).mean()
+    return pi_loss, info
+
+def update_pi(
+    pi: nnx.Module,
+    model: WorldModel,
+    pi_optim: nnx.Optimizer,
+    scale: RunningScale,
+    zs: Array,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+):
+    """Update the policy using a sequence of latent states.
+
+    Parameters
+    ----------
+    zs
+        Sequence of latent states.
+
+    Returns
+    -------
+    float
+        Loss of the policy update.
+
+    See Also
+    --------
+    _pi_loss
+    """
+    (pi_loss, info), pi_loss_grads = nnx.value_and_grad(
+        _pi_loss,
+        argnums=0,
+        has_aux=True,
+    )(
+        pi, model, scale, zs, rngs, cfg
+    )
+    pi_grad_norm = optax.tree_utils.tree_norm(pi_loss_grads, ord=2)
+    pi_optim.update(pi, pi_loss_grads)
+    # self.pi_optim.zero_grad(set_to_none=True) # TODO: removable?
+
+    info = {
+        "policy loss": pi_loss,
+        "policy grad norm": pi_grad_norm,
+        "policy entropy": info["entropy"],
+        "policy scaled entropy": info["scaled_entropy"],
+        "policy scale": scale.value,
+        "policy scale updates": scale.updates, # TODO: remove
+        "policy scale last mean": scale.mean, # TODO: remove
+        "policy scale last std": scale.std, # TODO: remove
+    }
+    return info
+
+# TODO: removable?
+# @torch.no_grad()
+def _td_target(
+    cfg: AgentConfig,
+    model: WorldModel,
+    pi: nnx.Module,
+    next_z: Array,
+    reward: Array,
+    rngs: nnx.Rngs,
+) -> Array:
+    """Compute the TD-target from a reward and the observation at
+    the following time step.
+
+    Arguments
+    ---------
+    next_z
+        Latent state at the following time step.
+    reward
+        Reward at the current time step.
+    rngs
+        Rngs for invoking the policy.
+
+    Returns
+    -------
+    Array
+        TD-target.
+    """
+    action, _ = sample_pi(pi, next_z, rngs, cfg)
+    print(f"{reward.shape=}")
+    return reward + cfg.discount * model.Q(
+        next_z, action, rngs=rngs, return_type="min", target=True
+    )
+
+def _model_loss(
+    model: WorldModel,
+    pi: nnx.Module,
+    obs: Array,
+    action: Array,
+    reward: Array,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+) -> tuple[Array, dict[str, Array]]:
+    # Compute targets
+    next_z = lax.stop_gradient(model.encode(obs[1:]))
+    td_targets = lax.stop_gradient(_td_target(cfg, model, pi, next_z, reward, rngs))
+
+    # Prepare for update
+    model.train()
+
+    # Latent rollout
+    zs = jnp.zeros((
+        cfg.horizon + 1,
+        cfg.batch_size,
+        cfg.latent_dim,
+    ))
+    z = model.encode(obs.at[0].get())
+    zs = zs.at[0].set(z)
+    consistency_loss = 0
+    for t, (_action, _next_z) in enumerate(zip(
+        jnp.unstack(action, axis=0),
+        jnp.unstack(next_z, axis=0),
+        strict=False,
+    )):
+        z = model.next(z, _action)
+        consistency_loss = (
+            consistency_loss + mse_loss(z, _next_z) * cfg.rho**t
+        )
+        zs = zs.at[t + 1].set(z)
+
+    # Predictions
+    _zs = zs.at[:-1].get()
+    qs = model.Q(_zs, action, return_type="all")
+    reward_preds = model.reward(_zs, action)
+
+    # Compute losses
+    reward_loss = jnp.float_(0)
+    value_loss = jnp.float_(0)
+    for t, (
+        rew_pred_unbind,
+        rew_unbind,
+        td_targets_unbind,
+        qs_unbind,
+    ) in enumerate(
+        zip(
+            jnp.unstack(reward_preds, axis=0),
+            jnp.unstack(reward, axis=0),
+            jnp.unstack(td_targets, axis=0),
+            jnp.unstack(qs, axis=1),
+            strict=False,
+        )
+    ):
+        reward_loss = (
+            reward_loss
+            + soft_ce(
+                rew_pred_unbind,
+                rew_unbind,
+                cfg.vmin,
+                cfg.vmax,
+                cfg.bin_size,
+                cfg.num_bins,
+            ).mean()
+            * cfg.rho**t
+        )
+        for _, qs_unbind_unbind in enumerate(jnp.unstack(qs_unbind, axis=0)):
+            value_loss = (
+                value_loss
+                + soft_ce(
+                    qs_unbind_unbind,
+                    td_targets_unbind,
+                    cfg.vmin,
+                    cfg.vmax,
+                    cfg.bin_size,
+                    cfg.num_bins,
+                ).mean()
+                * cfg.rho**t
+            )
+
+    consistency_loss = consistency_loss / cfg.horizon
+    reward_loss = reward_loss / cfg.horizon
+    value_loss = value_loss / (cfg.horizon * cfg.num_q)
+    total_loss = (
+        cfg.consistency_coef * consistency_loss
+        + cfg.reward_coef * reward_loss
+        + cfg.value_coef * value_loss
+    )
+
+    info = {
+        "consistency loss": consistency_loss,
+        "reward loss": reward_loss,
+        "q loss": value_loss,
+        "total loss": total_loss,
+    }
+
+    return total_loss, (info, zs)
+
+
+@partial(nnx.jit, static_argnames=["cfg"])
+def _update(
+    model: WorldModel,
+    pi: nnx.Module,
+    model_optim: nnx.Optimizer,
+    pi_optim: nnx.Optimizer,
+    scale: RunningScale,
+    obs: Array,
+    action: Array,
+    reward: Array,
+    rngs: nnx.Rngs,
+    cfg: AgentConfig,
+):
+    # Update model
+    (model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
+        _model_loss,
+        argnums=0,
+        has_aux=True,
+    )(
+        model, pi, obs, action, reward, rngs, cfg
+    )
+    model_grad_norm = optax.tree_utils.tree_norm(model_loss_grads, ord=2)
+    model_optim.update(model, model_loss_grads)
+    # self.optim.zero_grad(set_to_none=True) # TODO: removable?
+
+    # Update policy
+    pi_info = update_pi(pi, model, pi_optim, scale, zs, rngs, cfg)
+
+    # Update target Q-functions
+    soft_target_net_update(
+        net=model.Qs,
+        target_net=model.target_Qs,
+        tau=cfg.tau,
+    )
+
+    # Return training statistics
+    model.eval()
+    info = model_info
+    info["grad norm"] = model_grad_norm
+    info.update(pi_info)
+    mean_info = jax.tree.map(lambda val: jnp.mean(val), info)
+    return mean_info
+
+@staticmethod
+def _prepare_batch(batch):
+    # shapes are ~(trajectories, transitions, ...)
+    obs, action, reward, next_obs, terminated, truncated = batch
+    # make them ~(transitions, trajectories, ...)
+    # TODO: improve?
+    obs = jnp.swapaxes(obs, 0, 1)
+    action = jnp.swapaxes(action, 0, 1)
+    reward = jnp.expand_dims(
+        jnp.swapaxes(reward, 0, 1),
+        axis=-1,
+    )
+    next_obs = jnp.swapaxes(next_obs, 0, 1)
+    # terminated + truncated are not needed by TDMPC2._update()
+
+    # TDMPC2._update() just needs a single obs sequence, not both
+    # obs and next_obs, which share all the same observations but
+    # one at the start and one at the end of a trajectory. Thus,
+    # combine them to obtain an obs sequence that is 1 longer than
+    # the trajectory.
+    # shape of obs will then be ~(transitions+1, trajectories, ...)
+    obs = jnp.concatenate([jnp.expand_dims(obs.at[0].get(), 0), next_obs])
+    return obs, action, reward
+
+def update(
+    model: WorldModel,
+    pi: nnx.Module,
+    model_optim: nnx.Optimizer,
+    pi_optim: nnx.Optimizer,
+    scale: RunningScale,
+    buffer: SubtrajectoryReplayBuffer,
+    rngs: nnx.Rngs,
+    np_rng: np.random.Generator,
+    cfg: AgentConfig,
+):
+    """
+    Main update function. Corresponds to one iteration of model learning.
+
+    Args:
+            buffer (common.buffer.Buffer): Replay buffer.
+
+    Returns:
+            dict: Dictionary of training statistics.
+    """
+    batch = buffer.sample_batch(
+        batch_size=cfg.batch_size,
+        horizon=cfg.horizon,
+        include_intermediate=True,
+        rng=np_rng,
+    )
+    prepared_batch = _prepare_batch(batch)
+    obs, action, reward = prepared_batch
+    return _update(
+        model=model,
+        pi=pi,
+        model_optim=model_optim,
+        pi_optim=pi_optim,
+        scale=scale,
+        obs=obs,
+        action=action,
+        reward=reward,
+        rngs=rngs,
+        cfg=cfg,
+    )
 
 class WorldModel(nnx.Module):
     """TD-MPC2 implicit world model architecture.
@@ -1896,43 +1624,21 @@ class WorldModel(nnx.Module):
             mlp_dims=2 * [cfg.mlp_dim],
             out_dim=max(cfg.num_bins, 1),
             rngs=rngs,
+            last_layer_inits_to_zero=True,
         )
-        self._reward.layers[-1].kernel = jnp.full_like(
-            self._reward.layers[-1].kernel,
-            0.0,
-        )
-        self._pi = mlp(
-            in_dim=cfg.latent_dim,
-            mlp_dims=2 * [cfg.mlp_dim],
-            out_dim=2 * cfg.action_dim,
-            rngs=rngs,
-        )
-        # TODO: Fix Ensemble and following lines (via vmap?)
-        self._Qs = Ensemble(
-            [
-                mlp(
-                    in_dim=cfg.latent_dim + cfg.action_dim,
-                    mlp_dims=2 * [cfg.mlp_dim],
-                    out_dim=max(cfg.num_bins, 1),
-                    rngs=rngs,
-                    dropout=cfg.dropout,
-                )
-                for _ in range(cfg.num_q)
-            ]
-        )
-        # Comes from zero_([..., self._Qs.params["2", "weight"]]):
-        for module in self._Qs.modules:
-            module.layers[-1].kernel = jnp.full_like(
-                module.layers[-1].kernel,
-                0.0
+        print("Fix _Qs Ensemble IMMDEDIATELY!")
+        def make_single_Q(rngs: nnx.Rngs):
+            return mlp(
+                in_dim=cfg.latent_dim + cfg.action_dim,
+                mlp_dims=2 * [cfg.mlp_dim],
+                out_dim=max(cfg.num_bins, 1),
+                rngs=rngs,
+                dropout=cfg.dropout,
+                last_layer_inits_to_zero=True,
             )
-        self._detach_Qs = nnx.clone(self._Qs)
-        self._target_Qs = EMA(nnx.clone(self._Qs), update_weight=self.cfg.tau)
+        self.Qs = Ensemble(make_single_Q, n=self.cfg.num_q, rngs=rngs)
+        self.target_Qs = nnx.clone(self.Qs)
 
-        self._log_std_min = NonlearnableVariable(jnp.array(cfg.log_std_min))
-        self._log_std_dif = NonlearnableVariable(
-            jnp.array(cfg.log_std_max) - self._log_std_min
-        )
         self.init()
 
     def init(self):
@@ -1993,27 +1699,7 @@ class WorldModel(nnx.Module):
         super().train(**attributes)
         self._target_Qs.eval()
 
-    def soft_update_target_Q(self):
-        """Soft-update target Q-networks using Polyak averaging."""
-        self._target_Qs.update(self._detach_Qs)
-
-    # TODO: unused?
-    def task_emb(self, x, task):
-        """Continuous task embedding for multi-task experiments.
-
-        Retrieves the task embedding for a given task ID `task`
-        and concatenates it to the input `x`.
-        """
-        if isinstance(task, int):
-            task = jnp.array([task])
-        emb = self._task_emb(task.long())
-        if x.ndim == 3:
-            emb = emb.unsqueeze(0).repeat(x.shape[0], 1, 1)
-        elif emb.shape[0] == 1:
-            emb = emb.repeat(x.shape[0], 1)
-        return torch.cat([x, emb], dim=-1)
-
-    def encode(self, obs: ArrayLike, task):
+    def encode(self, obs: Array):
         """Encodes an observation into its latent representation.
 
         This implementation assumes a single state-based observation.
@@ -2022,7 +1708,7 @@ class WorldModel(nnx.Module):
             return jnp.stack([self._encoder[self.cfg.obs](o) for o in obs])
         return self._encoder[self.cfg.obs](obs)
 
-    def next(self, z: ArrayLike, a: ArrayLike, task) -> Array:
+    def next(self, z: ArrayLike, a: ArrayLike) -> Array:
         """Predicts the next latent state given the current latent state
         and action.
 
@@ -2031,47 +1717,16 @@ class WorldModel(nnx.Module):
         z = jnp.concat([z, a], axis=-1)
         return self._dynamics(z)
 
-    def reward(self, z: ArrayLike, a: ArrayLike, task) -> Array:
+    def reward(self, z: ArrayLike, a: ArrayLike) -> Array:
         """Predicts instantaneous (single-step) reward.
 
         Reward. In the paper: R(z,a,e).
         """
+        #print(f"Reward: {z.shape=}")
+        #print(f"Reward: {a.shape=}")
         z = jnp.concat([z, a], axis=-1)
+        #print(f"Reward: {z.shape=}")
         return self._reward(z)
-
-    def pi(
-        self, z: ArrayLike, task, rngs: nnx.Rngs
-    ) -> tuple[Array, dict[str, Array]]:
-        """Samples an action from the policy prior.
-
-        The policy prior is a Gaussian distribution with
-        mean and (log) std predicted by a neural network.
-        """
-        # Gaussian policy prior
-        # NOTE: chunk->split, last chunk would be allowed shorter
-        mean, log_std = jnp.split(self._pi(z), 2, axis=-1)
-        log_std = safe_log_std(log_std, self._log_std_min, self._log_std_dif)
-        eps = rngs.normal(shape=mean.shape, dtype=mean.dtype)
-
-        log_prob = gaussian_logprob(eps, log_std)
-
-        # Scale log probability by action dimensions
-        size = eps.shape[-1]
-        scaled_log_prob = log_prob * size
-
-        # Reparameterization trick
-        action = mean + eps * jnp.exp(log_std)
-        mean, action, log_prob = squash(mean, action, log_prob)
-
-        entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-        info = {
-            "mean": mean,
-            "log_std": log_std,
-            "action_prob": jnp.array(1.0),
-            "entropy": -log_prob,
-            "scaled_entropy": -log_prob * entropy_scale,
-        }
-        return action, info
 
     def Q(
         self,
@@ -2096,10 +1751,13 @@ class WorldModel(nnx.Module):
         if target:
             qnet = self._target_Qs
         elif detach:
+            raise AssertionError()
             qnet = self._detach_Qs
         else:
             qnet = self._Qs
         out = qnet(z)
+
+        print(f"{out.shape=}")
 
         if return_type == "all":
             return out
@@ -2118,8 +1776,99 @@ class WorldModel(nnx.Module):
             return q_value.min(axis=0)
         return q_value.sum(axis=0) / 2
 
+def sample_pi(
+    pi: nnx.Module, z: ArrayLike, rngs: nnx.Rngs, cfg: AgentConfig
+) -> tuple[Array, dict[str, Array]]:
+    """Samples an action from the policy prior.
+
+    The policy prior is a Gaussian distribution with
+    mean and (log) std predicted by a neural network.
+    """
+    print(f"{z.shape=}")
+    # Gaussian policy prior
+    # NOTE: chunk->split, last chunk would be allowed shorter
+    mean, log_std = jnp.split(pi(z), 2, axis=-1)
+    print(f"{mean.shape=}")
+    log_std = safe_log_std(
+        log_std,
+        jnp.array(cfg.log_std_min), # TODO: convert to jax somewhere else for efficiency?
+        jnp.array(cfg.log_std_dif)
+    )
+    eps = rngs.normal(shape=mean.shape, dtype=mean.dtype)
+
+    log_prob = gaussian_logprob(eps, log_std)
+
+    # Scale log probability by action dimensions
+    size = eps.shape[-1]
+    scaled_log_prob = log_prob * size
+
+    # Reparameterization trick
+    action = mean + eps * jnp.exp(log_std)
+    print(f"{action.shape=}")
+    mean, action, log_prob = squash(mean, action, log_prob)
+
+    entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+    print(f'{scaled_log_prob.shape=}')
+    print(f'{log_prob.shape=}')
+    print(f'{(-log_prob * entropy_scale).shape=}')
+    info = {
+        "mean": mean,
+        "log_std": log_std,
+        "action_prob": jnp.array(1.0),
+        "entropy": -log_prob,
+        "scaled_entropy": -log_prob * entropy_scale,
+    }
+    return action, info
 
 class Ensemble(nnx.Module):
+    """
+    Vectorized ensemble of modules.
+    """
+
+    def __init__(
+        self,
+        make_module: Callable[[nnx.Rngs], nnx.Module],
+        n: int,
+        rngs: nnx.Rngs,
+     ):
+        @nnx.split_rngs(splits=n)
+        @nnx.vmap
+        def _make_module(rngs: nnx.Rngs):
+            return make_module(rngs)
+
+        self.modules = _make_module(rngs)
+        # combine_state_for_ensemble causes graph breaks
+        # self.params = from_modules(*modules, as_module=True)
+        # with self.params[0].data.to("meta").to_module(modules[0]):
+        #     self.module = deepcopy(modules[0])
+        # self._repr = str(modules[0])
+        self._n = n
+        
+        def forward(module: nnx.Module, x: Array) -> Array:
+            return module(x)
+        self._forward = nnx.vmap(forward, in_axes=(0, None))
+
+    # TODO: removable?
+    # def __len__(self):
+    #     return self._n
+
+    # @nnx.vmap(in_axes=(0, None))
+    # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
+    #     return module(x)
+    #
+    def __call__(self, x: Array) -> Array: #, *args, **kwargs): # TODO: removable?
+        # #@nnx.vmap(in_axes=(0, None))
+        # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
+        #     return module(x)
+        # forward = nnx.vmap(_forward, in_axes=(0, None))
+        return self._forward(self.modules, x)
+
+    # TODO: removable?
+    # def __repr__(self):
+    #     return f"Vectorized {len(self)}x " + self._repr
+
+
+class EnsembleOld(nnx.Module):
     """
     Vectorized ensemble of modules.
     """
@@ -2296,10 +2045,13 @@ def mlp(
     rngs: nnx.Rngs,
     act: Callable[..., Any] | None = None,
     dropout: float = 0.0,
+    last_layer_inits_to_zero: bool = False,
 ) -> nnx.Sequential:
     """
     Basic building block of TD-MPC2.
     MLP with LayerNorm, Mish activations, and optionally dropout.
+    Weights are initialized according to a truncated normal distribution,
+    unless last_layer_inits_to_zero. Biases are always initialized to 0.
 
     Parameters
     ----------
@@ -2316,8 +2068,21 @@ def mlp(
         Activation function for the output layer.
     dropout
         Dropout probability used for all hidden layers.
+    last_layer_inits_to_zero
+        If True, the weights of the last layer are initialized to zero.
+    
     """
-    kernel_init = nnx.initializers.truncated_normal(0.02)
+    std=0.02
+    kernel_init = nnx.initializers.truncated_normal(
+        stddev=std,
+        lower=-2.0/std,
+        upper=2.0/std,
+    )
+    last_layer_kernel_init = (
+        nnx.initializers.constant(0.0)
+        if last_layer_inits_to_zero
+        else kernel_init
+    )
     bias_init = nnx.initializers.constant(0.0)
     if isinstance(mlp_dims, int):  # just one hidden layer
         mlp_dims = [mlp_dims]
@@ -2341,7 +2106,7 @@ def mlp(
             rngs=rngs,
             act=act,
             dropout=0.0,
-            kernel_init=kernel_init,
+            kernel_init=last_layer_kernel_init,
             bias_init=bias_init,
         )
         if act
@@ -2349,7 +2114,7 @@ def mlp(
             dims[-2],
             dims[-1],
             rngs=rngs,
-            kernel_init=kernel_init,
+            kernel_init=last_layer_kernel_init,
             bias_init=bias_init,
         )
     )
@@ -2406,63 +2171,6 @@ def enc(cfg: AgentConfig, rngs: nnx.Rngs, out={}):
             )
     return out
 
-
-def api_model_conversion(target_state_dict, source_state_dict):
-    """
-    Converts a checkpoint from our old API to the new torch.compile compatible API.
-    """
-    # check whether checkpoint is already in the new format
-    if "_detach_Qs_params.0.weight" in source_state_dict:
-        return source_state_dict
-
-    name_map = ["weight", "bias", "ln.weight", "ln.bias"]
-    new_state_dict = dict()
-
-    # rename keys
-    for key, val in list(source_state_dict.items()):
-        if key.startswith("_Qs."):
-            num = key[len("_Qs.params.") :]
-            new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-            new_total_key = "_Qs.params." + new_key
-            del source_state_dict[key]
-            new_state_dict[new_total_key] = val
-            new_total_key = "_detach_Qs_params." + new_key
-            new_state_dict[new_total_key] = val
-        elif key.startswith("_target_Qs."):
-            num = key[len("_target_Qs.params.") :]
-            new_key = str(int(num) // 4) + "." + name_map[int(num) % 4]
-            new_total_key = "_target_Qs_params." + new_key
-            del source_state_dict[key]
-            new_state_dict[new_total_key] = val
-
-    # add batch_size and device from target_state_dict to new_state_dict
-    for prefix in ("_Qs.", "_detach_Qs_", "_target_Qs_"):
-        for key in ("__batch_size", "__device"):
-            new_key = prefix + "params." + key
-            new_state_dict[new_key] = target_state_dict[new_key]
-
-    # check that every key in new_state_dict is in target_state_dict
-    for key in new_state_dict:
-        assert key in target_state_dict, f"key {key} not in target_state_dict"
-    # check that all Qs keys in target_state_dict are in new_state_dict
-    for key in target_state_dict.keys():
-        if "Qs" in key:
-            assert key in new_state_dict, f"key {key} not in new_state_dict"
-    # check that source_state_dict contains no Qs keys
-    for key in source_state_dict.keys():
-        assert "Qs" not in key, f"key {key} contains 'Qs'"
-
-    # copy log_std_min and log_std_max from target_state_dict to new_state_dict
-    new_state_dict["log_std_min"] = target_state_dict["log_std_min"]
-    new_state_dict["log_std_dif"] = target_state_dict["log_std_dif"]
-    new_state_dict["_action_masks"] = target_state_dict["_action_masks"]
-
-    # copy new_state_dict to source_state_dict
-    source_state_dict.update(new_state_dict)
-
-    return source_state_dict
-
-
 # TODO: removable?
 # TODO: initialize ParameterList? Where is this anyway?
 # def weight_init(m):
@@ -2473,12 +2181,45 @@ def api_model_conversion(target_state_dict, source_state_dict):
 #                 nn.init.trunc_normal_(p, std=0.02)  # Weight
 #                 nn.init.constant_(m[i + 1], 0)  # Bias
 
+def discount_heuristic(
+    episode_length: int,
+    discount_denom: int,
+    discount_min: float,
+    discount_max: float,
+) -> float:
+    """Returns the discount factor for a given episode length.
+
+    Simple heuristic that scales discount linearly with episode length.
+    Default values should work well for most tasks, but can be changed
+    as needed.
+
+    Args
+    ----
+    episode_length
+        Length of the episode. Assumes episodes are of fixed length.
+
+    TODO...
+
+    Returns
+    -------
+    float
+        Discount factor for the task.
+    """
+    frac = episode_length / discount_denom
+    return min(
+        max(
+            (frac - 1) / (frac),
+            discount_min,
+        ),
+        discount_max,
+    )
+
 
 def complete_config(
     env: gym.Env,
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
-) -> (AgentConfig, TrainingConfig):
+) -> tuple[AgentConfig, TrainingConfig]:
     """Fill in some configuration values that are based on others.
 
     TODO: Document which config fields are set here and which other fields they depend on.
@@ -2512,6 +2253,13 @@ def complete_config(
         training_cfg.seed_steps = max(1000, 5 * agent_cfg.episode_length)
     # Heuristic for large action spaces
     agent_cfg.iterations += 2 * int(agent_cfg.action_dim >= 20)
+    agent_cfg.discount = discount_heuristic(
+        episode_length=agent_cfg.episode_length,
+        discount_denom=agent_cfg.discount_denom,
+        discount_min=agent_cfg.discount_min,
+        discount_max=agent_cfg.discount_max,
+    )
+    agent_cfg.log_std_dif = agent_cfg.log_std_max - agent_cfg.log_std_min
     return agent_cfg, training_cfg
 
 
@@ -2519,7 +2267,7 @@ def train_tdmpc2(
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
-    rng_seed: int = 1,
+    seed: int = 1,
     logger: LoggerBase | None = None,
     timer: Timer = Timer(),
 ) -> TDMPC2:
@@ -2561,20 +2309,26 @@ def train_tdmpc2(
     # Check parameters, compute defaults, and create configuration object
     assert training_cfg.steps > 0, "Must train for at least 1 step."
 
-    agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
-
     gym.logger.min_level = 40
     env = DefaultSuccessInfoWrapper(env)
 
+    agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
     full_cfg = FullTrainingConfig(*agent_cfg, *training_cfg)
+    state = create_tdmpc2_state(agent_cfg, seed)
 
-    trainer = OnlineTrainer(
+    print(f"FLAX {full_cfg=}")
+
+    result = _train(
         cfg=full_cfg,
         env=env,
-        agent=TDMPC2.from_config(agent_cfg, rng_seed),
+        model=state.model,
+        pi=state.policy,
+        model_optim=state.model_optimizer,
+        pi_optim=state.policy_optimizer,
+        rngs=nnx.Rngs(seed),
+        np_rng=np.random.default_rng(seed),
         logger=logger,
         timer=timer,
     )
-    trainer.train()
     print("\nTraining completed successfully")
-    return trainer.agent
+    return result
