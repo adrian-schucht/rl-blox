@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import os
 
-from recordclass import recordclass
+from recordclass import recordclass, dataobject, asdict
 
 os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
 os.environ["LAZY_LEGACY_OP"] = "0"
@@ -114,6 +114,36 @@ CAT_TO_COLOR = {
     "train": "blue",
     "eval": "green",
 }
+
+# class TDMPC2Result(dataobject):
+#     model: WorldModel
+#     pi: nnx.Module
+#     previous_mean: Array
+
+class TDMPC2AgentState(nnx.Module):
+    @staticmethod
+    def create_from(cfg: AgentConfig, rngs: nnx.Rngs):
+        return TDMPC2AgentState(
+            model=WorldModel(cfg, rngs),
+            pi=create_tdmpc2_pi(cfg, rngs),
+            previous_mean=jnp.zeros(shape=(cfg.horizon, cfg.action_dim)),
+        )
+
+    def __init__(self, model: WorldModel, pi: nnx.Module, previous_mean: Array):
+        self.model = model
+        self.pi = pi
+        self.previous_mean = nnx.Variable(previous_mean)
+
+class TDMPC2TrainState:
+    def __init__(
+        self,
+        agent_state: TDMPC2AgentState,
+        model_optimizer: nnx.Optimizer,
+        pi_optimizer: nnx.Optimizer,
+    ): # TODO
+        self.agent_state = agent_state
+        self.model_optimizer = model_optimizer
+        self.pi_optimizer = pi_optimizer
 
 AgentConfig = recordclass(
     "AgentConfig",
@@ -783,15 +813,12 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
 def _train(
     cfg: FullTrainingConfig,
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
-    model: WorldModel,
-    pi: nnx.Module,
-    model_optim: nnx.Optimizer,
-    pi_optim: nnx.Optimizer,
+    train_state: TDMPC2TrainState,
     rngs: nnx.Rngs,
     np_rng: np.random.Generator,
     logger: LoggerBase | None = None,
     timer: Timer = Timer(),
-):
+) -> TDMPC2AgentState:
     """Train a TD-MPC2 agent."""
     buffer = SubtrajectoryReplayBuffer(
         buffer_size=min(cfg.buffer_size, cfg.steps),
@@ -805,7 +832,13 @@ def _train(
     done, eval_next = True, False
     steps_in_episode = 0
     episode_reward = 0.0
-    previous_mean = None
+    agent_state = train_state.agent_state
+    model = agent_state.model
+    pi = agent_state.pi
+    previous_mean = agent_state.previous_mean
+    model_optim = train_state.model_optimizer
+    pi_optim = train_state.pi_optimizer
+
     progress = trange(
         step, cfg.steps, disable=not cfg.progress_bar
     )
@@ -909,11 +942,16 @@ def _train(
                 if i == num_updates - 1 and logger is not None:
                     for k, v in metrics.items():
                         logger.record_stat(k, v)
-            # TODO fix
-            # if logger is not None:
-            #     logger.record_epoch(
-            #         AGENT_CHECKPOINTING_ID, agent, step=step # TODO: plumb
-            #     )
+            if logger is not None:
+                logger.record_epoch(
+                    key="result",
+                    value=TDMPC2AgentState(
+                        model=model,
+                        pi=pi,
+                        previous_mean=previous_mean,
+                    ),
+                    step=step,
+                )
 
     for i in range(1001):
         if i == 1:
@@ -936,17 +974,24 @@ def _train(
         timer.log(logger)
         logger.stop_episode(steps_in_episode)
 
+    return TDMPC2AgentState(
+        model=model,
+        pi=pi,
+        previous_mean=previous_mean,
+    )
 
-def create_tdmpc2_state(cfg: AgentConfig, seed: int = 0):
-    rngs = nnx.Rngs(seed)
-    np_rng = np.random.default_rng(seed)
-    model = WorldModel(cfg, rngs)
-    policy = mlp(
+def create_tdmpc2_pi(cfg: AgentConfig, rngs: nnx.Rngs):
+    return mlp(
         in_dim=cfg.latent_dim,
         mlp_dims=2 * [cfg.mlp_dim],
         out_dim=2 * cfg.action_dim,
         rngs=rngs,
     )
+
+def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
+    rngs = nnx.Rngs(seed)
+    np_rng = np.random.default_rng(seed)
+    agent_state = TDMPC2AgentState.create_from(cfg, rngs)
     labeled_state = nnx.State({
         "_encoder": "encoder",
         "_dynamics": "default",
@@ -957,7 +1002,7 @@ def create_tdmpc2_state(cfg: AgentConfig, seed: int = 0):
         "_target_Qs": "off",
     })
     model_optimizer = nnx.Optimizer(
-        model,
+        agent_state.model,
         optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
             optax.partition(
@@ -973,8 +1018,8 @@ def create_tdmpc2_state(cfg: AgentConfig, seed: int = 0):
         ),
         wrt=nnx.Param,
     )
-    policy_optimizer = nnx.Optimizer(
-        policy,
+    pi_optimizer = nnx.Optimizer(
+        agent_state.pi,
         optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
             optax.adam(
@@ -984,22 +1029,32 @@ def create_tdmpc2_state(cfg: AgentConfig, seed: int = 0):
         ),
         wrt=nnx.Param,
     )
-    model.eval()
-    policy.eval()
+    agent_state.model.eval() # TODO: Moveable to TDMPC2AgentState?
+    agent_state.pi.eval()
+    return TDMPC2TrainState(
+        agent_state=agent_state,
+        model_optimizer=model_optimizer,
+        pi_optimizer=pi_optimizer,
+    )
+
+def _make_result(
+    model: WorldModel,
+    pi: nnx.Module,
+    previous_mean: Array,
+):
     return namedtuple(
-        "TDMPC2State",
+        "TDMPC2Result",
         [
             "model",
-            "policy",
-            "model_optimizer",
-            "policy_optimizer",
+            "pi",
+            "previous_mean",
         ],
     )(
         model,
-        policy,
-        model_optimizer,
-        policy_optimizer,
+        pi,
+        previous_mean,
     )
+
 
 # TODO: lax.stop_gradient() on call
 # @torch.no_grad()
@@ -1075,7 +1130,7 @@ def _estimate_value(
     G, discount = 0, 1
     for t in range(cfg.horizon):
         reward = two_hot_inv(
-            model.reward(z, actions.at[t].get()),
+            model.reward_fwd(z, actions.at[t].get()),
             cfg.vmin,
             cfg.vmax,
             cfg.num_bins,
@@ -1246,6 +1301,8 @@ def _plan(
     a, std = actions.at[0].get(), std.at[0].get()
     if not eval_mode:
         a = a + std * rngs.normal(cfg.action_dim)
+    else:
+        a = jnp.expand_dims(a, axis=0)
     return namedtuple(
         "PlanningResult",
         [
@@ -1423,7 +1480,7 @@ def _model_loss(
     # Predictions
     _zs = zs.at[:-1].get()
     qs = model.Q(_zs, action, return_type="all")
-    reward_preds = model.reward(_zs, action)
+    reward_preds = model.reward_fwd(_zs, action)
 
     # Compute losses
     reward_loss = jnp.float_(0)
@@ -1611,22 +1668,21 @@ class WorldModel(nnx.Module):
     def __init__(self, cfg: AgentConfig, rngs: nnx.Rngs):
         super().__init__()
         self.cfg = cfg
-        self._encoder = enc(cfg, rngs)
-        self._dynamics = mlp(
+        self.encoder = enc(cfg, rngs)
+        self.dynamics = mlp(
             in_dim=cfg.latent_dim + cfg.action_dim,
             mlp_dims=2 * [cfg.mlp_dim],
             out_dim=cfg.latent_dim,
             rngs=rngs,
             act=SimNorm(cfg.simnorm_dim),
         )
-        self._reward = mlp(
+        self.reward = mlp(
             in_dim=cfg.latent_dim + cfg.action_dim,
             mlp_dims=2 * [cfg.mlp_dim],
             out_dim=max(cfg.num_bins, 1),
             rngs=rngs,
             last_layer_inits_to_zero=True,
         )
-        print("Fix _Qs Ensemble IMMDEDIATELY!")
         def make_single_Q(rngs: nnx.Rngs):
             return mlp(
                 in_dim=cfg.latent_dim + cfg.action_dim,
@@ -1697,7 +1753,7 @@ class WorldModel(nnx.Module):
         """Overriding `train` method to keep target Q-networks in eval mode."""
         # TODO: Ensure that this behaves the same as torch's train(mode) here.
         super().train(**attributes)
-        self._target_Qs.eval()
+        self.target_Qs.eval()
 
     def encode(self, obs: Array):
         """Encodes an observation into its latent representation.
@@ -1705,8 +1761,8 @@ class WorldModel(nnx.Module):
         This implementation assumes a single state-based observation.
         """
         if self.cfg.obs == "rgb" and obs.ndim == 5:
-            return jnp.stack([self._encoder[self.cfg.obs](o) for o in obs])
-        return self._encoder[self.cfg.obs](obs)
+            return jnp.stack([self.encoder[self.cfg.obs](o) for o in obs])
+        return self.encoder[self.cfg.obs](obs)
 
     def next(self, z: ArrayLike, a: ArrayLike) -> Array:
         """Predicts the next latent state given the current latent state
@@ -1715,9 +1771,9 @@ class WorldModel(nnx.Module):
         Latent dynamics. In the paper: d(z,a,e).
         """
         z = jnp.concat([z, a], axis=-1)
-        return self._dynamics(z)
+        return self.dynamics(z)
 
-    def reward(self, z: ArrayLike, a: ArrayLike) -> Array:
+    def reward_fwd(self, z: ArrayLike, a: ArrayLike) -> Array:
         """Predicts instantaneous (single-step) reward.
 
         Reward. In the paper: R(z,a,e).
@@ -1726,7 +1782,7 @@ class WorldModel(nnx.Module):
         #print(f"Reward: {a.shape=}")
         z = jnp.concat([z, a], axis=-1)
         #print(f"Reward: {z.shape=}")
-        return self._reward(z)
+        return self.reward(z)
 
     def Q(
         self,
@@ -1749,12 +1805,12 @@ class WorldModel(nnx.Module):
 
         z = jnp.concatenate([z, a], axis=-1)
         if target:
-            qnet = self._target_Qs
+            qnet = self.target_Qs
         elif detach:
             raise AssertionError()
             qnet = self._detach_Qs
         else:
-            qnet = self._Qs
+            qnet = self.Qs
         out = qnet(z)
 
         print(f"{out.shape=}")
@@ -2270,7 +2326,7 @@ def train_tdmpc2(
     seed: int = 1,
     logger: LoggerBase | None = None,
     timer: Timer = Timer(),
-) -> TDMPC2:
+) -> TDMPC2AgentState:
     """TD-MPC2 from [1]_.
 
     Note that some parts are not described in [1]_ but only in [2]_.
@@ -2314,17 +2370,14 @@ def train_tdmpc2(
 
     agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
     full_cfg = FullTrainingConfig(*agent_cfg, *training_cfg)
-    state = create_tdmpc2_state(agent_cfg, seed)
+    train_state = create_tdmpc2_train_state(agent_cfg, seed)
 
     print(f"FLAX {full_cfg=}")
 
     result = _train(
         cfg=full_cfg,
         env=env,
-        model=state.model,
-        pi=state.policy,
-        model_optim=state.model_optimizer,
-        pi_optim=state.policy_optimizer,
+        train_state=train_state,
         rngs=nnx.Rngs(seed),
         np_rng=np.random.default_rng(seed),
         logger=logger,
