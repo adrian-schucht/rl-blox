@@ -115,11 +115,6 @@ CAT_TO_COLOR = {
     "eval": "green",
 }
 
-# class TDMPC2Result(dataobject):
-#     model: WorldModel
-#     pi: nnx.Module
-#     previous_mean: Array
-
 class TDMPC2AgentState(nnx.Module):
     @staticmethod
     def create_from(cfg: AgentConfig, rngs: nnx.Rngs):
@@ -140,7 +135,7 @@ class TDMPC2TrainState:
         agent_state: TDMPC2AgentState,
         model_optimizer: nnx.Optimizer,
         pi_optimizer: nnx.Optimizer,
-    ): # TODO
+    ):
         self.agent_state = agent_state
         self.model_optimizer = model_optimizer
         self.pi_optimizer = pi_optimizer
@@ -662,29 +657,17 @@ def gumbel_softmax_sample(
     return jnp.argmax(y_soft, axis=-1)
 
 
-class NonlearnableVariable(nnx.Variable):
-    pass
-
-
 class RunningScale(nnx.Module):
     """Running trimmed scale estimator."""
 
     def __init__(self, cfg: AgentConfig):
         super().__init__()
         self.cfg = cfg
-        self.value = NonlearnableVariable(jnp.array(1.0))
+        self.value = nnx.Variable(jnp.array(1.0))
         self.updates = jnp.array(0, dtype=int)
         self.mean = jnp.array(0)
         self.std = jnp.array(0)
-        self._percentiles = NonlearnableVariable(jnp.array([5, 95]))
-
-    # TODO: removable?
-    # def state_dict(self):
-    #     return dict(value=self.value, percentiles=self._percentiles)
-    #
-    # def load_state_dict(self, state_dict):
-    #     self.value.copy_(state_dict["value"])
-    #     self._percentiles.copy_(state_dict["percentiles"])
+        self._percentiles = nnx.Variable(jnp.array([5, 95]))
 
     def _positions(self, x_shape) -> tuple[Array, Array, Array, Array]:
         positions = self._percentiles * (x_shape - 1) / 100
@@ -705,7 +688,6 @@ class RunningScale(nnx.Module):
         x_dtype, x_shape = x.dtype, x.shape
         print(f"{x_shape=}")
         x = jax.vmap(jnp.ravel)(x)
-        # x = x.flatten(1, x.ndim - 1) # NOTE: this was here before
         in_sorted = jnp.sort(x, axis=0)
         floored, ceiled, weight_floored, weight_ceiled = self._positions(
             x.shape[0]
@@ -713,8 +695,6 @@ class RunningScale(nnx.Module):
         d0 = in_sorted[floored] * weight_floored
         d1 = in_sorted[ceiled] * weight_ceiled
         return jnp.reshape(d0 + d1, (-1,) + x_shape[1:]).astype(x_dtype)
-        # NOTE: was previously:
-        # return (d0 + d1).reshape(-1, *x_shape[1:]).to(x_dtype)
 
     def update(self, x: Array):
         x = x.squeeze()
@@ -735,10 +715,6 @@ class RunningScale(nnx.Module):
         if update:
             self.update(x)
         return x / self.value
-
-    # TODO: removable?
-    # def __repr__(self):
-    #     return f"RunningScale(S: {self.value})"
 
 
 def make_dir(dir_path):
@@ -764,52 +740,6 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
         info["success"] = float(info["success"])
         return obs, reward, termination, truncation, info
 
-
-# TODO: removable?
-# def eval(self):
-#     """Evaluate a TD-MPC2 agent."""
-#     ep_rewards, ep_successes = [], []
-#     for i in range(self.cfg.eval_episodes):
-#         obs, _ = self.env.reset()
-#         done, ep_reward, t = False, 0, 0
-#         while not done:
-#             torch.compiler.cudagraph_mark_step_begin()
-#             action = self.agent.act(obs, t0=t == 0, eval_mode=True)
-#             obs, reward, termination, truncation, info = self.env.step(
-#                 action
-#             )
-#             done = termination or truncation
-#             ep_reward += reward
-#             t += 1
-#         ep_rewards.append(ep_reward)
-#         ep_successes.append(info["success"])
-#     return dict(
-#         episode_reward=np.nanmean(ep_rewards),
-#         episode_success=np.nanmean(ep_successes),
-#     )
-
-
-    # TODO: removable?
-    # def to_td(self, obs, action=None, reward=None):
-    #     """Creates a TensorDict for a new episode."""
-    #     if isinstance(obs, dict):
-    #         obs = TensorDict(obs, batch_size=(), device="cpu")
-    #     else:
-    #         obs = obs.unsqueeze(0).cpu()
-    #     if action is None:
-    #         action = torch.full_like(
-    #             self.env.sample_action_space(), float("nan")
-    #         )
-    #     if reward is None:
-    #         reward = torch.tensor(float("nan"))
-    #     td = TensorDict(
-    #         obs=obs,
-    #         action=action.unsqueeze(0),
-    #         reward=reward.unsqueeze(0),
-    #         batch_size=(1,),
-    #     )
-    #     return td
-
 def _train(
     cfg: FullTrainingConfig,
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
@@ -829,7 +759,7 @@ def _train(
     ep_idx = 0
     start_time = time.time()
     transitions_in_episode = []
-    done, eval_next = True, False
+    done = True
     steps_in_episode = 0
     episode_reward = 0.0
     agent_state = train_state.agent_state
@@ -846,24 +776,8 @@ def _train(
     timer.start("training")
     timer.start("seed_acquisition")
     for step in np.arange(step, cfg.steps + 1):
-        # Evaluate agent periodically
-        if step % cfg.eval_freq == 0:
-            eval_next = False  # FIXME: originally True
-
         # Reset environment
         if done:
-            if eval_next:
-                timer.start("eval")
-                eval_metrics = eval()
-                eval_metrics.update(dict(
-                        step=step,
-                        episode=ep_idx,
-                        total_time=time.time()-start_time,
-                ))
-                # TODO: log? evaluate at all?
-                eval_next = False
-                timer.stop("eval")
-
             if step > 0:
                 episode_success = info["success"]
                 if logger is not None:
@@ -968,7 +882,7 @@ def _train(
         )
     timer.stop("acting")
 
-    # End last (potentially partial) episode # TODO: necessary?
+    # End last (potentially partial) episode
     if logger is not None:
         timer.stop("training")
         timer.log(logger)
@@ -990,21 +904,18 @@ def create_tdmpc2_pi(cfg: AgentConfig, rngs: nnx.Rngs):
 
 def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
     rngs = nnx.Rngs(seed)
-    np_rng = np.random.default_rng(seed)
     agent_state = TDMPC2AgentState.create_from(cfg, rngs)
     labeled_state = nnx.State({
         "_encoder": "encoder",
         "_dynamics": "default",
         "_reward": "default",
         "_Qs": "default",
-        # TODO: was detach
-        # "_detach_Qs": "off",
         "_target_Qs": "off",
     })
     model_optimizer = nnx.Optimizer(
         agent_state.model,
         optax.chain(
-            optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+            optax.clip_by_global_norm(cfg.grad_clip_norm),
             optax.partition(
                 {
                     "encoder": optax.adam(
@@ -1021,7 +932,7 @@ def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
     pi_optimizer = nnx.Optimizer(
         agent_state.pi,
         optax.chain(
-            optax.clip_by_global_norm(cfg.grad_clip_norm), # TODO: This ok?
+            optax.clip_by_global_norm(cfg.grad_clip_norm),
             optax.adam(
                 learning_rate=cfg.lr,
                 eps=1e-5,
@@ -1029,7 +940,7 @@ def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
         ),
         wrt=nnx.Param,
     )
-    agent_state.model.eval() # TODO: Moveable to TDMPC2AgentState?
+    agent_state.model.eval()
     agent_state.pi.eval()
     return TDMPC2TrainState(
         agent_state=agent_state,
@@ -1055,9 +966,6 @@ def _make_result(
         previous_mean,
     )
 
-
-# TODO: lax.stop_gradient() on call
-# @torch.no_grad()
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def act(
     model: WorldModel,
@@ -1112,8 +1020,6 @@ def act(
         info["mean"],
     )
 
-# TODO: removable?
-# @torch.no_grad()
 def _estimate_value(
     cfg: AgentConfig,
     model: WorldModel,
@@ -1142,8 +1048,6 @@ def _estimate_value(
     action, _ = sample_pi(pi, z, rngs, cfg)
     return G + discount * model.Q(z, action, rngs=rngs, return_type="avg") # TODO
 
-# TODO: lax.stop_gradient() on call
-# @torch.no_grad()
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def _plan(
     model: WorldModel,
@@ -1209,9 +1113,6 @@ def _plan(
         repeats=cfg.num_samples,
         axis=0,
     )
-    # TODO: correct repeat?
-    # NOTE: before this:
-    # z = z.repeat(self.cfg.num_samples, 1)
     mean = jnp.zeros(
         (cfg.horizon, cfg.action_dim)
     )
@@ -1338,9 +1239,6 @@ def _pi_loss(
         WorldModel.pi().
     """
     action, info = sample_pi(pi, zs, rngs, cfg)
-    # TODO: was detach
-    # TODO: stop grad or something?
-    # qs = model.Q(zs, action, rngs=rngs, return_type="avg", detach=True)
     qs = model.Q(zs, action, rngs=rngs, return_type="avg")
     scale.update(qs.at[0].get())
     qs = scale(qs)
@@ -1394,7 +1292,6 @@ def update_pi(
     )
     pi_grad_norm = optax.tree_utils.tree_norm(pi_loss_grads, ord=2)
     pi_optim.update(pi, pi_loss_grads)
-    # self.pi_optim.zero_grad(set_to_none=True) # TODO: removable?
 
     info = {
         "policy loss": pi_loss,
@@ -1408,8 +1305,6 @@ def update_pi(
     }
     return info
 
-# TODO: removable?
-# @torch.no_grad()
 def _td_target(
     cfg: AgentConfig,
     model: WorldModel,
@@ -1567,7 +1462,6 @@ def _update(
     )
     model_grad_norm = optax.tree_utils.tree_norm(model_loss_grads, ord=2)
     model_optim.update(model, model_loss_grads)
-    # self.optim.zero_grad(set_to_none=True) # TODO: removable?
 
     # Update policy
     pi_info = update_pi(pi, model, pi_optim, scale, zs, rngs, cfg)
@@ -1592,7 +1486,6 @@ def _prepare_batch(batch):
     # shapes are ~(trajectories, transitions, ...)
     obs, action, reward, next_obs, terminated, truncated = batch
     # make them ~(transitions, trajectories, ...)
-    # TODO: improve?
     obs = jnp.swapaxes(obs, 0, 1)
     action = jnp.swapaxes(action, 0, 1)
     reward = jnp.expand_dims(
@@ -1695,63 +1588,9 @@ class WorldModel(nnx.Module):
         self.Qs = Ensemble(make_single_Q, n=self.cfg.num_q, rngs=rngs)
         self.target_Qs = nnx.clone(self.Qs)
 
-        self.init()
-
-    def init(self):
-        # TODO: removable?
-        # # Create params
-        # self._detach_Qs_params = TensorDictParams(
-        #     self._Qs.params.data, no_convert=True
-        # )
-        # self._target_Qs_params = TensorDictParams(
-        #     self._Qs.params.data.clone(), no_convert=True
-        # )
-        #
-        # # Create modules
-        # with self._detach_Qs_params.data.to("meta").to_module(self._Qs.module):
-        #     self._detach_Qs = deepcopy(self._Qs)
-        #     self._target_Qs = deepcopy(self._Qs)
-        #
-        # # Assign params to modules
-        # # We do this strange assignment to avoid having duplicated tensors in the state-dict -- working on a better API for this
-        # delattr(self._detach_Qs, "params")
-        # self._detach_Qs.__dict__["params"] = self._detach_Qs_params
-        # delattr(self._target_Qs, "params")
-        # self._target_Qs.__dict__["params"] = self._target_Qs_params
-        pass
-
-    # TODO: removable?
-    # def __repr__(self):
-    #     repr = "TD-MPC2 World Model\n"
-    #     modules = [
-    #         "Encoder",
-    #         "Dynamics",
-    #         "Reward",
-    #         "Policy prior",
-    #         "Q-functions",
-    #     ]
-    #     for i, m in enumerate(
-    #         [self._encoder, self._dynamics, self._reward, self._pi, self._Qs]
-    #     ):
-    #         repr += f"{modules[i]}: {m}\n"
-    #     repr += f"Learnable parameters: {self.total_params:,}"
-    #     return repr
-
-    @property
-    def total_params(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    # TODO: removable?
-    # def to(self, *args, **kwargs):
-    #     super().to(*args, **kwargs)
-    #     self.init()
-    #     return self
-
-    # TODO
     @override
     def train(self, **attributes):
         """Overriding `train` method to keep target Q-networks in eval mode."""
-        # TODO: Ensure that this behaves the same as torch's train(mode) here.
         super().train(**attributes)
         self.target_Qs.eval()
 
@@ -1778,10 +1617,7 @@ class WorldModel(nnx.Module):
 
         Reward. In the paper: R(z,a,e).
         """
-        #print(f"Reward: {z.shape=}")
-        #print(f"Reward: {a.shape=}")
         z = jnp.concat([z, a], axis=-1)
-        #print(f"Reward: {z.shape=}")
         return self.reward(z)
 
     def Q(
@@ -1791,7 +1627,6 @@ class WorldModel(nnx.Module):
         return_type: Literal["min", "avg", "all"]="min",
         rngs: nnx.Rngs | None = None,
         target: bool=False,
-        detach: bool=False
     ):
         """
         Predict state-action value.
@@ -1806,9 +1641,6 @@ class WorldModel(nnx.Module):
         z = jnp.concatenate([z, a], axis=-1)
         if target:
             qnet = self.target_Qs
-        elif detach:
-            raise AssertionError()
-            qnet = self._detach_Qs
         else:
             qnet = self.Qs
         out = qnet(z)
@@ -1840,14 +1672,12 @@ def sample_pi(
     The policy prior is a Gaussian distribution with
     mean and (log) std predicted by a neural network.
     """
-    print(f"{z.shape=}")
     # Gaussian policy prior
-    # NOTE: chunk->split, last chunk would be allowed shorter
     mean, log_std = jnp.split(pi(z), 2, axis=-1)
     print(f"{mean.shape=}")
     log_std = safe_log_std(
         log_std,
-        jnp.array(cfg.log_std_min), # TODO: convert to jax somewhere else for efficiency?
+        jnp.array(cfg.log_std_min),
         jnp.array(cfg.log_std_dif)
     )
     eps = rngs.normal(shape=mean.shape, dtype=mean.dtype)
@@ -1893,74 +1723,14 @@ class Ensemble(nnx.Module):
             return make_module(rngs)
 
         self.modules = _make_module(rngs)
-        # combine_state_for_ensemble causes graph breaks
-        # self.params = from_modules(*modules, as_module=True)
-        # with self.params[0].data.to("meta").to_module(modules[0]):
-        #     self.module = deepcopy(modules[0])
-        # self._repr = str(modules[0])
         self._n = n
         
         def forward(module: nnx.Module, x: Array) -> Array:
             return module(x)
         self._forward = nnx.vmap(forward, in_axes=(0, None))
 
-    # TODO: removable?
-    # def __len__(self):
-    #     return self._n
-
-    # @nnx.vmap(in_axes=(0, None))
-    # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
-    #     return module(x)
-    #
     def __call__(self, x: Array) -> Array: #, *args, **kwargs): # TODO: removable?
-        # #@nnx.vmap(in_axes=(0, None))
-        # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
-        #     return module(x)
-        # forward = nnx.vmap(_forward, in_axes=(0, None))
         return self._forward(self.modules, x)
-
-    # TODO: removable?
-    # def __repr__(self):
-    #     return f"Vectorized {len(self)}x " + self._repr
-
-
-class EnsembleOld(nnx.Module):
-    """
-    Vectorized ensemble of modules.
-    """
-
-    def __init__(self, modules: list[nnx.Module]):
-        super().__init__()
-        self.modules = modules
-        # combine_state_for_ensemble causes graph breaks
-        # self.params = from_modules(*modules, as_module=True)
-        # with self.params[0].data.to("meta").to_module(modules[0]):
-        #     self.module = deepcopy(modules[0])
-        # self._repr = str(modules[0])
-        self._n = len(modules)
-        
-        def forward(module: nnx.Module, x: Array) -> Array:
-            return module(x)
-        self._forward = nnx.vmap(forward, in_axes=(0, None))
-
-    def __len__(self):
-        return self._n
-
-    # @nnx.vmap(in_axes=(0, None))
-    # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
-    #     return module(x)
-    #
-    def __call__(self, x: Array) -> Array: #, *args, **kwargs): # TODO: removable?
-        # #@nnx.vmap(in_axes=(0, None))
-        # def _forward(module: nnx.Module, x: Array) -> Array: # , *args, **kwargs): # TODO: removable?
-        #     return module(x)
-        # forward = nnx.vmap(_forward, in_axes=(0, None))
-        return self._forward(self.modules, x)
-
-    # TODO: removable?
-    # def __repr__(self):
-    #     return f"Vectorized {len(self)}x " + self._repr
-
 
 class ShiftAug(nnx.Module):
     """
@@ -2050,10 +1820,6 @@ class SimNorm(nnx.Module):
         x = nnx.softmax(x, axis=-1)
         return jnp.reshape(x, shp)
 
-    # TODO: removable?
-    # def __repr__(self):
-    #     return f"SimNorm(dim={self.dim})"
-
 
 class NormedLinear(nnx.Linear):
     """
@@ -2082,17 +1848,6 @@ class NormedLinear(nnx.Linear):
         if self.dropout:
             x = self.dropout(x)
         return self.act(self.ln(x))
-
-    # TODO: removable?
-    # def __repr__(self):
-    #     repr_dropout = f", dropout={self.dropout.p}" if self.dropout else ""
-    #     return (
-    #         f"NormedLinear(in_features={self.in_features}, "
-    #         f"out_features={self.out_features}, "
-    #         f"bias={self.bias is not None}{repr_dropout}, "
-    #         f"act={self.act.__class__.__name__})"
-    #     )
-
 
 def mlp(
     in_dim: int,
@@ -2226,16 +1981,6 @@ def enc(cfg: AgentConfig, rngs: nnx.Rngs, out={}):
                 f"Encoder for observation type {k} not implemented."
             )
     return out
-
-# TODO: removable?
-# TODO: initialize ParameterList? Where is this anyway?
-# def weight_init(m):
-#     """Custom weight initialization for TD-MPC2."""
-#     elif isinstance(m, nn.ParameterList):
-#         for i, p in enumerate(m):
-#             if p.dim() == 3:  # Linear
-#                 nn.init.trunc_normal_(p, std=0.02)  # Weight
-#                 nn.init.constant_(m[i + 1], 0)  # Bias
 
 def discount_heuristic(
     episode_length: int,
@@ -2372,9 +2117,7 @@ def train_tdmpc2(
     full_cfg = FullTrainingConfig(*agent_cfg, *training_cfg)
     train_state = create_tdmpc2_train_state(agent_cfg, seed)
 
-    print(f"FLAX {full_cfg=}")
-
-    result = _train(
+    return _train(
         cfg=full_cfg,
         env=env,
         train_state=train_state,
@@ -2383,5 +2126,3 @@ def train_tdmpc2(
         logger=logger,
         timer=timer,
     )
-    print("\nTraining completed successfully")
-    return result
