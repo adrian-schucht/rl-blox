@@ -637,7 +637,6 @@ def two_hot_inv(
     dreg_bins = jnp.linspace(vmin, vmax, num_bins, dtype=x.dtype)
     x = nnx.softmax(x, axis=-1)
     x = jnp.sum(x * dreg_bins, axis=-1, keepdims=True)
-    print(f"{x.shape=}")
     return symexp(x)
 
 
@@ -687,9 +686,7 @@ class RunningScale(nnx.Module):
         )
 
     def _percentile(self, x: Array) -> Array:
-        print(f"{x=}")
         x_dtype, x_shape = x.dtype, x.shape
-        print(f"{x_shape=}")
         x = jax.vmap(jnp.ravel)(x)
         in_sorted = jnp.sort(x, axis=0)
         floored, ceiled, weight_floored, weight_ceiled = self._positions(
@@ -703,8 +700,6 @@ class RunningScale(nnx.Module):
         x = x.squeeze()
         percentiles = self._percentile(x)  # NOTE: previously detach()
         value = jnp.clip(percentiles[1] - percentiles[0], min=1.0)
-        print(f"RunningScale -> update() -> {self.value.shape=}")
-        print(f"RunningScale -> update() -> {value.shape=}")
         self.value = jnp.interp(
             x=self.cfg.tau,
             xp=jnp.array([0.0, 1.0]),
@@ -1089,7 +1084,6 @@ def _plan(
     # Sample policy trajectories.
     # (l. 4, Algorithm 1, TD-MPC (inference), [2]_)
     z = model.encode(obs)
-    print(f"_plan()/model.encode() -> {z.shape=}")
     if cfg.num_pi_trajs > 0:
         pi_actions = jnp.empty(
             shape=(
@@ -1103,13 +1097,8 @@ def _plan(
             repeats=cfg.num_pi_trajs,
             axis=0,
         )
-        print(f"{_z.shape=}")
-        # NOTE: before this:
-        # _z = z.repeat(self.cfg.num_pi_trajs, 1)
         for t in range(cfg.horizon - 1):
             action, _ = sample_pi(pi, _z, rngs, cfg)
-            print(f"{action.shape=}")
-            print(f"{pi_actions.shape=}")
             pi_actions = pi_actions.at[t].set(action)
             _z = model.next(_z, pi_actions[t])
         action, _ = sample_pi(pi, _z, rngs, cfg)
@@ -1163,9 +1152,6 @@ def _plan(
 
         # Compute elite actions
         value = _estimate_value(cfg, model, pi, z, actions, rngs)
-        print(f"_estimate_value -> {value.shape=}")
-        print(f"{value.shape=}")
-        print(f"{value.squeeze(1).shape=}")
         _, elite_idxs = jax.lax.top_k(
             value.squeeze(1),
             cfg.num_elites,
@@ -1249,10 +1235,6 @@ def _pi_loss(
     # Loss is a weighted sum of Q-values
     # (rho is lambda in Equation (4), [2]_)
     rho = jnp.pow(cfg.rho, jnp.arange(len(qs)))
-    print(f"{cfg.entropy_coef=}")
-    print(f'{info["scaled_entropy"]=}')
-    print(f'{cfg.entropy_coef * info["scaled_entropy"]=}')
-    print(f"{qs=}")
     pi_loss = (
         -(cfg.entropy_coef * info["scaled_entropy"] + qs).mean(axis=(1, 2))
         * rho
@@ -1332,7 +1314,6 @@ def _td_target(
         TD-target.
     """
     action, _ = sample_pi(pi, next_z, rngs, cfg)
-    print(f"{reward.shape=}")
     return reward + cfg.discount * model.Q(
         next_z, action, rngs=rngs, return_type="min", target=True
     )
@@ -1654,8 +1635,6 @@ class WorldModel(nnx.Module):
             qnet = self.Qs
         out = qnet(z)
 
-        print(f"{out.shape=}")
-
         if return_type == "all":
             return out
 
@@ -1684,7 +1663,6 @@ def sample_pi(
     """
     # Gaussian policy prior
     mean, log_std = jnp.split(pi(z), 2, axis=-1)
-    print(f"{mean.shape=}")
     log_std = safe_log_std(
         log_std, jnp.array(cfg.log_std_min), jnp.array(cfg.log_std_dif)
     )
@@ -1698,13 +1676,9 @@ def sample_pi(
 
     # Reparameterization trick
     action = mean + eps * jnp.exp(log_std)
-    print(f"{action.shape=}")
     mean, action, log_prob = squash(mean, action, log_prob)
 
     entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-    print(f"{scaled_log_prob.shape=}")
-    print(f"{log_prob.shape=}")
-    print(f"{(-log_prob * entropy_scale).shape=}")
     info = {
         "mean": mean,
         "log_std": log_std,
