@@ -115,6 +115,7 @@ CAT_TO_COLOR = {
     "eval": "green",
 }
 
+
 class TDMPC2AgentState(nnx.Module):
     @staticmethod
     def create_from(cfg: AgentConfig, rngs: nnx.Rngs):
@@ -129,6 +130,7 @@ class TDMPC2AgentState(nnx.Module):
         self.pi = pi
         self.previous_mean = nnx.Variable(previous_mean)
 
+
 class TDMPC2TrainState:
     def __init__(
         self,
@@ -139,6 +141,7 @@ class TDMPC2TrainState:
         self.agent_state = agent_state
         self.model_optimizer = model_optimizer
         self.pi_optimizer = pi_optimizer
+
 
 AgentConfig = recordclass(
     "AgentConfig",
@@ -465,7 +468,7 @@ def make_agent_cfg(
         temperature=temperature,
         log_std_min=log_std_min,
         log_std_max=log_std_max,
-        log_std_dif=None, # Set during training
+        log_std_dif=None,  # Set during training
         entropy_coef=entropy_coef,
         num_bins=num_bins,
         vmin=vmin,
@@ -740,6 +743,7 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
         info["success"] = float(info["success"])
         return obs, reward, termination, truncation, info
 
+
 def _train(
     cfg: FullTrainingConfig,
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
@@ -769,9 +773,7 @@ def _train(
     model_optim = train_state.model_optimizer
     pi_optim = train_state.pi_optimizer
 
-    progress = trange(
-        step, cfg.steps, disable=not cfg.progress_bar
-    )
+    progress = trange(step, cfg.steps, disable=not cfg.progress_bar)
 
     timer.start("training")
     timer.start("seed_acquisition")
@@ -782,9 +784,7 @@ def _train(
                 episode_success = info["success"]
                 if logger is not None:
                     logger.record_stat("return", value=episode_reward)
-                    logger.record_stat(
-                        "success", value=episode_success
-                    )
+                    logger.record_stat("success", value=episode_success)
                     logger.stop_episode(steps_in_episode)
 
                 steps_in_episode = 0
@@ -799,7 +799,7 @@ def _train(
         # Collect experience
         if step > cfg.seed_steps:
             timer.start("agent_act")
-            t0 = (steps_in_episode == 0)
+            t0 = steps_in_episode == 0
             action, previous_mean = act(
                 model=model,
                 pi=pi,
@@ -894,6 +894,7 @@ def _train(
         previous_mean=previous_mean,
     )
 
+
 def create_tdmpc2_pi(cfg: AgentConfig, rngs: nnx.Rngs):
     return mlp(
         in_dim=cfg.latent_dim,
@@ -902,16 +903,19 @@ def create_tdmpc2_pi(cfg: AgentConfig, rngs: nnx.Rngs):
         rngs=rngs,
     )
 
+
 def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
     rngs = nnx.Rngs(seed)
     agent_state = TDMPC2AgentState.create_from(cfg, rngs)
-    labeled_state = nnx.State({
-        "_encoder": "encoder",
-        "_dynamics": "default",
-        "_reward": "default",
-        "_Qs": "default",
-        "_target_Qs": "off",
-    })
+    labeled_state = nnx.State(
+        {
+            "_encoder": "encoder",
+            "_dynamics": "default",
+            "_reward": "default",
+            "_Qs": "default",
+            "_target_Qs": "off",
+        }
+    )
     model_optimizer = nnx.Optimizer(
         agent_state.model,
         optax.chain(
@@ -948,6 +952,7 @@ def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
         pi_optimizer=pi_optimizer,
     )
 
+
 def _make_result(
     model: WorldModel,
     pi: nnx.Module,
@@ -965,6 +970,7 @@ def _make_result(
         pi,
         previous_mean,
     )
+
 
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def act(
@@ -1014,11 +1020,12 @@ def act(
         [
             "action",
             "mean",
-        ]
+        ],
     )(
         action.at[0].get(),
         info["mean"],
     )
+
 
 def _estimate_value(
     cfg: AgentConfig,
@@ -1047,6 +1054,7 @@ def _estimate_value(
         discount = discount * discount_update
     action, _ = sample_pi(pi, z, rngs, cfg)
     return G + discount * model.Q(z, action, rngs=rngs, return_type="avg")
+
 
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def _plan(
@@ -1097,7 +1105,7 @@ def _plan(
         )
         print(f"{_z.shape=}")
         # NOTE: before this:
-        #_z = z.repeat(self.cfg.num_pi_trajs, 1)
+        # _z = z.repeat(self.cfg.num_pi_trajs, 1)
         for t in range(cfg.horizon - 1):
             action, _ = sample_pi(pi, _z, rngs, cfg)
             print(f"{action.shape=}")
@@ -1113,9 +1121,7 @@ def _plan(
         repeats=cfg.num_samples,
         axis=0,
     )
-    mean = jnp.zeros(
-        (cfg.horizon, cfg.action_dim)
-    )
+    mean = jnp.zeros((cfg.horizon, cfg.action_dim))
     std = jnp.full(
         (cfg.horizon, cfg.action_dim),
         fill_value=cfg.max_std,
@@ -1153,7 +1159,7 @@ def _plan(
         )
         actions_sample = jnp.expand_dims(mean, 1) + jnp.expand_dims(std, 1) * r
         actions_sample = jnp.clip(actions_sample, -1.0, 1.0)
-        actions = actions.at[:, cfg.num_pi_trajs:].set(actions_sample)
+        actions = actions.at[:, cfg.num_pi_trajs :].set(actions_sample)
 
         # Compute elite actions
         value = _estimate_value(cfg, model, pi, z, actions, rngs)
@@ -1172,14 +1178,10 @@ def _plan(
         max_value = jnp.max(elite_value, axis=0)
         score = jnp.exp(cfg.temperature * (elite_value - max_value))
         score = score / jnp.sum(score, axis=0)
-        mean = (
-            jnp.sum(
-                jnp.expand_dims(score, 0) * elite_actions,
-                axis=1,
-            ) / (
-                jnp.sum(score, 0) + 1e-9
-            )
-        )
+        mean = jnp.sum(
+            jnp.expand_dims(score, 0) * elite_actions,
+            axis=1,
+        ) / (jnp.sum(score, 0) + 1e-9)
         std = jnp.sqrt(
             jnp.sum(
                 (
@@ -1187,7 +1189,8 @@ def _plan(
                     * (elite_actions - jnp.expand_dims(mean, 1)) ** 2
                 ),
                 axis=1,
-            ) / (jnp.sum(score, 0) + 1e-9)
+            )
+            / (jnp.sum(score, 0) + 1e-9)
         )
         std = jnp.clip(std, cfg.min_std, cfg.max_std)
 
@@ -1208,11 +1211,12 @@ def _plan(
         [
             "action",
             "mean",
-        ]
-    ) (
+        ],
+    )(
         jnp.clip(a, -1.0, 1.0),
         mean,
     )
+
 
 def _pi_loss(
     pi: nnx.Module,
@@ -1245,17 +1249,16 @@ def _pi_loss(
     # Loss is a weighted sum of Q-values
     # (rho is lambda in Equation (4), [2]_)
     rho = jnp.pow(cfg.rho, jnp.arange(len(qs)))
-    print(f'{cfg.entropy_coef=}')
+    print(f"{cfg.entropy_coef=}")
     print(f'{info["scaled_entropy"]=}')
     print(f'{cfg.entropy_coef * info["scaled_entropy"]=}')
-    print(f'{qs=}')
+    print(f"{qs=}")
     pi_loss = (
-        -(cfg.entropy_coef * info["scaled_entropy"] + qs).mean(
-            axis=(1, 2)
-        )
+        -(cfg.entropy_coef * info["scaled_entropy"] + qs).mean(axis=(1, 2))
         * rho
     ).mean()
     return pi_loss, info
+
 
 def update_pi(
     pi: nnx.Module,
@@ -1286,9 +1289,7 @@ def update_pi(
         _pi_loss,
         argnums=0,
         has_aux=True,
-    )(
-        pi, model, scale, zs, rngs, cfg
-    )
+    )(pi, model, scale, zs, rngs, cfg)
     pi_grad_norm = optax.tree_utils.tree_norm(pi_loss_grads, ord=2)
     pi_optim.update(pi, pi_loss_grads)
 
@@ -1298,11 +1299,12 @@ def update_pi(
         "policy entropy": info["entropy"],
         "policy scaled entropy": info["scaled_entropy"],
         "policy scale": scale.value,
-        "policy scale updates": scale.updates, # TODO: remove
-        "policy scale last mean": scale.mean, # TODO: remove
-        "policy scale last std": scale.std, # TODO: remove
+        "policy scale updates": scale.updates,  # TODO: remove
+        "policy scale last mean": scale.mean,  # TODO: remove
+        "policy scale last std": scale.std,  # TODO: remove
     }
     return info
+
 
 def _td_target(
     cfg: AgentConfig,
@@ -1335,6 +1337,7 @@ def _td_target(
         next_z, action, rngs=rngs, return_type="min", target=True
     )
 
+
 def _model_loss(
     model: WorldModel,
     pi: nnx.Module,
@@ -1346,29 +1349,33 @@ def _model_loss(
 ) -> tuple[Array, dict[str, Array]]:
     # Compute targets
     next_z = lax.stop_gradient(model.encode(obs[1:]))
-    td_targets = lax.stop_gradient(_td_target(cfg, model, pi, next_z, reward, rngs))
+    td_targets = lax.stop_gradient(
+        _td_target(cfg, model, pi, next_z, reward, rngs)
+    )
 
     # Prepare for update
     model.train()
 
     # Latent rollout
-    zs = jnp.zeros((
-        cfg.horizon + 1,
-        cfg.batch_size,
-        cfg.latent_dim,
-    ))
+    zs = jnp.zeros(
+        (
+            cfg.horizon + 1,
+            cfg.batch_size,
+            cfg.latent_dim,
+        )
+    )
     z = model.encode(obs.at[0].get())
     zs = zs.at[0].set(z)
     consistency_loss = 0
-    for t, (_action, _next_z) in enumerate(zip(
-        jnp.unstack(action, axis=0),
-        jnp.unstack(next_z, axis=0),
-        strict=False,
-    )):
-        z = model.next(z, _action)
-        consistency_loss = (
-            consistency_loss + mse_loss(z, _next_z) * cfg.rho**t
+    for t, (_action, _next_z) in enumerate(
+        zip(
+            jnp.unstack(action, axis=0),
+            jnp.unstack(next_z, axis=0),
+            strict=False,
         )
+    ):
+        z = model.next(z, _action)
+        consistency_loss = consistency_loss + mse_loss(z, _next_z) * cfg.rho**t
         zs = zs.at[t + 1].set(z)
 
     # Predictions
@@ -1456,9 +1463,7 @@ def _update(
         _model_loss,
         argnums=0,
         has_aux=True,
-    )(
-        model, pi, obs, action, reward, rngs, cfg
-    )
+    )(model, pi, obs, action, reward, rngs, cfg)
     model_grad_norm = optax.tree_utils.tree_norm(model_loss_grads, ord=2)
     model_optim.update(model, model_loss_grads)
 
@@ -1479,6 +1484,7 @@ def _update(
     info.update(pi_info)
     mean_info = jax.tree.map(lambda val: jnp.mean(val), info)
     return mean_info
+
 
 @staticmethod
 def _prepare_batch(batch):
@@ -1502,6 +1508,7 @@ def _prepare_batch(batch):
     # shape of obs will then be ~(transitions+1, trajectories, ...)
     obs = jnp.concatenate([jnp.expand_dims(obs.at[0].get(), 0), next_obs])
     return obs, action, reward
+
 
 def update(
     model: WorldModel,
@@ -1544,6 +1551,7 @@ def update(
         cfg=cfg,
     )
 
+
 class WorldModel(nnx.Module):
     """TD-MPC2 implicit world model architecture.
 
@@ -1575,6 +1583,7 @@ class WorldModel(nnx.Module):
             rngs=rngs,
             last_layer_inits_to_zero=True,
         )
+
         def make_single_Q(rngs: nnx.Rngs):
             return mlp(
                 in_dim=cfg.latent_dim + cfg.action_dim,
@@ -1584,6 +1593,7 @@ class WorldModel(nnx.Module):
                 dropout=cfg.dropout,
                 last_layer_inits_to_zero=True,
             )
+
         self.Qs = Ensemble(make_single_Q, n=self.cfg.num_q, rngs=rngs)
         self.target_Qs = nnx.clone(self.Qs)
 
@@ -1623,9 +1633,9 @@ class WorldModel(nnx.Module):
         self,
         z: Array,
         a: Array,
-        return_type: Literal["min", "avg", "all"]="min",
+        return_type: Literal["min", "avg", "all"] = "min",
         rngs: nnx.Rngs | None = None,
-        target: bool=False,
+        target: bool = False,
     ):
         """
         Predict state-action value.
@@ -1663,6 +1673,7 @@ class WorldModel(nnx.Module):
             return q_value.min(axis=0)
         return q_value.sum(axis=0) / 2
 
+
 def sample_pi(
     pi: nnx.Module, z: ArrayLike, rngs: nnx.Rngs, cfg: AgentConfig
 ) -> tuple[Array, dict[str, Array]]:
@@ -1675,9 +1686,7 @@ def sample_pi(
     mean, log_std = jnp.split(pi(z), 2, axis=-1)
     print(f"{mean.shape=}")
     log_std = safe_log_std(
-        log_std,
-        jnp.array(cfg.log_std_min),
-        jnp.array(cfg.log_std_dif)
+        log_std, jnp.array(cfg.log_std_min), jnp.array(cfg.log_std_dif)
     )
     eps = rngs.normal(shape=mean.shape, dtype=mean.dtype)
 
@@ -1693,9 +1702,9 @@ def sample_pi(
     mean, action, log_prob = squash(mean, action, log_prob)
 
     entropy_scale = scaled_log_prob / (log_prob + 1e-8)
-    print(f'{scaled_log_prob.shape=}')
-    print(f'{log_prob.shape=}')
-    print(f'{(-log_prob * entropy_scale).shape=}')
+    print(f"{scaled_log_prob.shape=}")
+    print(f"{log_prob.shape=}")
+    print(f"{(-log_prob * entropy_scale).shape=}")
     info = {
         "mean": mean,
         "log_std": log_std,
@@ -1704,6 +1713,7 @@ def sample_pi(
         "scaled_entropy": -log_prob * entropy_scale,
     }
     return action, info
+
 
 class Ensemble(nnx.Module):
     """
@@ -1715,7 +1725,7 @@ class Ensemble(nnx.Module):
         make_module: Callable[[nnx.Rngs], nnx.Module],
         n: int,
         rngs: nnx.Rngs,
-     ):
+    ):
         @nnx.split_rngs(splits=n)
         @nnx.vmap
         def _make_module(rngs: nnx.Rngs):
@@ -1723,13 +1733,15 @@ class Ensemble(nnx.Module):
 
         self.modules = _make_module(rngs)
         self._n = n
-        
+
         def forward(module: nnx.Module, x: Array) -> Array:
             return module(x)
+
         self._forward = nnx.vmap(forward, in_axes=(0, None))
 
     def __call__(self, x: Array) -> Array:
         return self._forward(self.modules, x)
+
 
 class ShiftAug(nnx.Module):
     """
@@ -1848,6 +1860,7 @@ class NormedLinear(nnx.Linear):
             x = self.dropout(x)
         return self.act(self.ln(x))
 
+
 def mlp(
     in_dim: int,
     mlp_dims: list[int] | int,
@@ -1880,13 +1893,13 @@ def mlp(
         Dropout probability used for all hidden layers.
     last_layer_inits_to_zero
         If True, the weights of the last layer are initialized to zero.
-    
+
     """
-    std=0.02
+    std = 0.02
     kernel_init = nnx.initializers.truncated_normal(
         stddev=std,
-        lower=-2.0/std,
-        upper=2.0/std,
+        lower=-2.0 / std,
+        upper=2.0 / std,
     )
     last_layer_kernel_init = (
         nnx.initializers.constant(0.0)
@@ -1981,6 +1994,7 @@ def enc(cfg: AgentConfig, rngs: nnx.Rngs, out={}):
             )
     return out
 
+
 def discount_heuristic(
     episode_length: int,
     discount_denom: int,
@@ -2022,6 +2036,7 @@ def discount_heuristic(
         ),
         discount_max,
     )
+
 
 def complete_config(
     env: gym.Env,
