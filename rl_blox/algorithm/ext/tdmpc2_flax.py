@@ -1,9 +1,7 @@
-# Original source code of https://github.com/nicklashansen/tdmpc2 in one file
+# Original source code of https://github.com/nicklashansen/tdmpc2 in one file,
+# ported to JAX/Flax.
 
-# Dependencies:
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-# pip install torchrl tensordict termcolor
-# pip install array-api-compat # for gymnasium.wrappers.NumpyToTorch
+# Original license:
 
 # MIT License
 #
