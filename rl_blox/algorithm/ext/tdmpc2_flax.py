@@ -338,7 +338,7 @@ def make_agent_cfg(
         dynamics are consistent with the encoding of the true successor
         states (which come from the observation of actual dynamics of the
         environment).
-    rho # TODO: actually trace-discount parameter?
+    rho
         ~Discount factor in loss calculations; lambda in the paper. It is a
         "constant coefficient that weighs temporally farther time steps less"
         in loss calculations. Should be in (0, 1].
@@ -646,7 +646,7 @@ def gumbel_softmax_sample(
 ):
     logits = jnp.log(p)
     # Generate Gumbel noise
-    gumbels = -jnp.log(  # TODO: note torch.legacy_contiguous_format
+    gumbels = -jnp.log(
         rngs.exponential(
             shape=logits.shape,
             dtype=logits.dtype,
@@ -812,7 +812,7 @@ def _train(
             timer.stop("agent_act")
         else:
             timer.start("env_sample_action_space")
-            action = env.action_space.sample() # TODO
+            action = env.action_space.sample()
             timer.stop("env_sample_action_space")
         prev_obs = obs
         timer.start("env_step")
@@ -823,7 +823,7 @@ def _train(
             observation=prev_obs,
             action=action,
             reward=reward,
-            next_observation=obs, # TODO: removable? Was not here in original impl
+            next_observation=obs,
             terminated=termination,
             truncated=truncation,
         )
@@ -1046,7 +1046,7 @@ def _estimate_value(
         discount_update = cfg.discount
         discount = discount * discount_update
     action, _ = sample_pi(pi, z, rngs, cfg)
-    return G + discount * model.Q(z, action, rngs=rngs, return_type="avg") # TODO
+    return G + discount * model.Q(z, action, rngs=rngs, return_type="avg")
 
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def _plan(
@@ -1156,7 +1156,6 @@ def _plan(
         actions = actions.at[:, cfg.num_pi_trajs:].set(actions_sample)
 
         # Compute elite actions
-        # TODO: removable?: .nan_to_num(0)
         value = _estimate_value(cfg, model, pi, z, actions, rngs)
         print(f"_estimate_value -> {value.shape=}")
         print(f"{value.shape=}")
@@ -1729,7 +1728,7 @@ class Ensemble(nnx.Module):
             return module(x)
         self._forward = nnx.vmap(forward, in_axes=(0, None))
 
-    def __call__(self, x: Array) -> Array: #, *args, **kwargs): # TODO: removable?
+    def __call__(self, x: Array) -> Array:
         return self._forward(self.modules, x)
 
 class ShiftAug(nnx.Module):
@@ -1999,7 +1998,16 @@ def discount_heuristic(
     episode_length
         Length of the episode. Assumes episodes are of fixed length.
 
-    TODO...
+    discount_denom
+        Denominator in the heuristic for the discount factor, which changes
+        in response to the episode length, within the bounds of
+        [discount_min,discount_max].
+
+    discount_min
+        Minimum value for the discount factor.
+
+    discount_max
+        Maximum value for the discount factor.
 
     Returns
     -------
@@ -2014,7 +2022,6 @@ def discount_heuristic(
         ),
         discount_max,
     )
-
 
 def complete_config(
     env: gym.Env,
