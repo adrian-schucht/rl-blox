@@ -56,11 +56,6 @@ logging = [
 ]
 tdmpc2 = [
     "recordclass",
-    "torch",
-    "torchrl",
-    "tensordict",
-    "array-api-compat",
-    "termcolor",
 ]
 examples = ["gymnasium[classic-control,toy-text,mujoco]", "matplotlib"]
 doc = [
