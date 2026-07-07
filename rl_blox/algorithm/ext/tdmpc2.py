@@ -656,21 +656,6 @@ def make_dir(dir_path):
     return dir_path
 
 
-class DefaultSuccessInfoWrapper(gym.Wrapper):
-    """
-    Gym environment wrapper for filling the info["success"] field with a default value if missing.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-
-    def step(self, action):
-        obs, reward, termination, truncation, info = self.env.step(action)
-        info = defaultdict(float, info)
-        info["success"] = float(info["success"])
-        return obs, reward, termination, truncation, info
-
-
 def _train(
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
@@ -1823,6 +1808,22 @@ def enc(cfg: AgentConfig, rngs: nnx.Rngs):
         rngs=rngs,
         act=SimNorm(cfg.simnorm_dim),
     )
+
+
+class DefaultSuccessInfoWrapper(gym.Wrapper):
+    """
+    Gym environment wrapper for filling the info["success"] field with a default value if missing.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+
+    def step(self, action):
+        obs, reward, termination, truncation, info = self.env.step(action)
+        info = defaultdict(float, info)
+        info["success"] = float(info["success"])
+        return obs, reward, termination, truncation, info
+
 
 def discount_heuristic(
     episode_length: int,
