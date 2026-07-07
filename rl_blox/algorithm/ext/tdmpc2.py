@@ -831,11 +831,11 @@ def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
     agent_state = TDMPC2AgentState.create_from(cfg, rngs)
     labeled_state = nnx.State(
         {
-            "_encoder": "encoder",
-            "_dynamics": "default",
-            "_reward": "default",
-            "_Qs": "default",
-            "_target_Qs": "off",
+            "encoder": "encoder",
+            "dynamics": "default",
+            "reward": "default",
+            "Qs": "default",
+            "target_Qs": "off",
         }
     )
     model_optimizer = nnx.Optimizer(
