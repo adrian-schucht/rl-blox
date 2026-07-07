@@ -804,21 +804,6 @@ def _train(
                     step=step,
                 )
 
-    for i in range(1001):
-        if i == 1:
-            timer.start("acting")
-        test_obs = jnp.array(env.observation_space.sample())
-        act(
-            model=model,
-            pi=pi,
-            obs=test_obs,
-            previous_mean=previous_mean,
-            rngs=rngs,
-            cfg=cfg,
-            t0=False,
-        )
-    timer.stop("acting")
-
     # End last (potentially partial) episode
     if logger is not None:
         timer.stop("training")
