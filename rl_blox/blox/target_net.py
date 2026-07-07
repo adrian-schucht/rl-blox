@@ -2,11 +2,15 @@ from functools import partial
 
 import optax
 from flax import nnx
+from flax.nnx.filterlib import Filter
 
 
-@partial(nnx.jit, static_argnames=["tau"])
+@partial(nnx.jit, static_argnames=["tau", "filter"])
 def soft_target_net_update(
-    net: nnx.Module, target_net: nnx.Module, tau: float
+    net: nnx.Module,
+    target_net: nnx.Module,
+    tau: float,
+    filter: Filter | None = None,
 ) -> None:
     r"""Inplace (soft) update for target network with Polyak averaging.
 
@@ -36,9 +40,17 @@ def soft_target_net_update(
         The step size :math:`\tau`, i.e., the coefficient with which the live
         network's parameters will be multiplied. Must be in [0, 1]. Often
         :math:`\tau = 0.005` is used.
+
+    filter : Filter, optional
+        A :class:`Variable` subclass to filter by.
     """
-    params = nnx.state(net)
-    target_params = nnx.state(target_net)
+    if filter is not None:
+        params = nnx.state(net, filter)
+        target_params = nnx.state(target_net, filter)
+    else:
+        params = nnx.state(net)
+        target_params = nnx.state(target_net)
+
     target_params = optax.incremental_update(params, target_params, tau)
     nnx.update(target_net, target_params)
 
