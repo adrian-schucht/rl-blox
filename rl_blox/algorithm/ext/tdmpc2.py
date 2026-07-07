@@ -875,25 +875,6 @@ def create_tdmpc2_train_state(cfg: AgentConfig, seed: int = 0):
     )
 
 
-def _make_result(
-    model: WorldModel,
-    pi: nnx.Module,
-    previous_mean: Array,
-):
-    return namedtuple(
-        "TDMPC2Result",
-        [
-            "model",
-            "pi",
-            "previous_mean",
-        ],
-    )(
-        model,
-        pi,
-        previous_mean,
-    )
-
-
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
 def act(
     model: WorldModel,
