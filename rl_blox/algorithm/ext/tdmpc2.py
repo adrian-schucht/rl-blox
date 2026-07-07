@@ -186,6 +186,7 @@ class AgentConfig(NamedTuple):
     episode_length: int | None
     obs_shape: tuple[int]
 
+
 class TrainingConfig(NamedTuple):
     eval_episodes: int
     eval_freq: int
@@ -193,6 +194,7 @@ class TrainingConfig(NamedTuple):
     buffer_size: int
     seed_steps: int | None
     progress_bar: bool
+
 
 def make_agent_cfg(
     obs: str = "state",
@@ -677,7 +679,9 @@ def _train(
     model_optim = train_state.model_optimizer
     pi_optim = train_state.pi_optimizer
 
-    progress = trange(step, training_cfg.steps, disable=not training_cfg.progress_bar)
+    progress = trange(
+        step, training_cfg.steps, disable=not training_cfg.progress_bar
+    )
 
     timer.start("training")
     timer.start("seed_acquisition")
@@ -1882,9 +1886,7 @@ def complete_config(
     # Assumes observation space is a Box.
     obs_shape = env.observation_space.shape
     # Bin size for discrete regression
-    bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (
-        agent_cfg.num_bins - 1
-    )
+    bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (agent_cfg.num_bins - 1)
     action_dim = env.action_space.shape[0]
     episode_length = env.spec.max_episode_steps
     if training_cfg.seed_steps is None:
@@ -1914,6 +1916,7 @@ def complete_config(
         seed_steps=seed_steps,
     )
     return completed_agent_cfg, completed_training_cfg
+
 
 def train_tdmpc2(
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
