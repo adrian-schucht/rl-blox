@@ -775,7 +775,7 @@ def _train(
                     include_intermediate=True,
                     rng=np_rng,
                 )
-                obs_batch, action_batch, reward_batch = _prepare_batch(batch)
+                obs_batch, action_batch, reward_batch = prepare_batch(batch)
                 metrics = update(
                     model=model,
                     pi=pi,
@@ -904,7 +904,7 @@ def act(
     """
     obs = jnp.expand_dims(obs, axis=0)
     if cfg.mpc:
-        return _plan(
+        return plan(
             model=model,
             pi=pi,
             previous_mean=previous_mean,
@@ -930,7 +930,7 @@ def act(
     )
 
 
-def _estimate_value(
+def estimate_value(
     cfg: AgentConfig,
     model: WorldModel,
     pi: nnx.Module,
@@ -960,7 +960,7 @@ def _estimate_value(
 
 
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
-def _plan(
+def plan(
     model: WorldModel,
     pi: nnx.Module,
     previous_mean: Array | None,
@@ -1059,7 +1059,7 @@ def _plan(
         actions = actions.at[:, cfg.num_pi_trajs :].set(actions_sample)
 
         # Compute elite actions
-        value = _estimate_value(cfg, model, pi, z, actions, rngs)
+        value = estimate_value(cfg, model, pi, z, actions, rngs)
         _, elite_idxs = jax.lax.top_k(
             value.squeeze(1),
             cfg.num_elites,
@@ -1112,7 +1112,7 @@ def _plan(
     )
 
 
-def _pi_loss(
+def pi_loss(
     pi: nnx.Module,
     model: WorldModel,
     scale: RunningScale,
@@ -1173,10 +1173,10 @@ def update_pi(
 
     See Also
     --------
-    _pi_loss
+    pi_loss
     """
-    (pi_loss, info), pi_loss_grads = nnx.value_and_grad(
-        _pi_loss,
+    (_pi_loss, info), pi_loss_grads = nnx.value_and_grad(
+        pi_loss,
         argnums=0,
         has_aux=True,
     )(pi, model, scale, zs, rngs, cfg)
@@ -1184,7 +1184,7 @@ def update_pi(
     pi_optim.update(pi, pi_loss_grads)
 
     info = {
-        "policy loss": pi_loss,
+        "policy loss": _pi_loss,
         "policy grad norm": pi_grad_norm,
         "policy entropy": info["entropy"],
         "policy scaled entropy": info["scaled_entropy"],
@@ -1196,7 +1196,7 @@ def update_pi(
     return info
 
 
-def _td_target(
+def td_target(
     cfg: AgentConfig,
     model: WorldModel,
     pi: nnx.Module,
@@ -1227,7 +1227,7 @@ def _td_target(
     )
 
 
-def _model_loss(
+def model_loss(
     model: WorldModel,
     pi: nnx.Module,
     obs: Array,
@@ -1239,7 +1239,7 @@ def _model_loss(
     # Compute targets
     next_z = lax.stop_gradient(model.encode(obs[1:]))
     td_targets = lax.stop_gradient(
-        _td_target(cfg, model, pi, next_z, reward, rngs)
+        td_target(cfg, model, pi, next_z, reward, rngs)
     )
 
     # Prepare for update
@@ -1348,8 +1348,8 @@ def update(
     cfg: AgentConfig,
 ):
     # Update model
-    (model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
-        _model_loss,
+    (_model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
+        model_loss,
         argnums=0,
         has_aux=True,
     )(model, pi, obs, action, reward, rngs, cfg)
@@ -1377,7 +1377,7 @@ def update(
 
 
 @staticmethod
-def _prepare_batch(batch):
+def prepare_batch(batch):
     # shapes are ~(trajectories, transitions, ...)
     obs, action, reward, next_obs, terminated, truncated = batch
     # make them ~(transitions, trajectories, ...)
@@ -1874,8 +1874,6 @@ def complete_config(
 ) -> tuple[AgentConfig, TrainingConfig]:
     """Fill in some configuration values that are based on others.
 
-    TODO: Document which config fields are set here and which other fields they depend on.
-
     Parameters
     ----------
     env : gym.Env
@@ -1886,7 +1884,7 @@ def complete_config(
 
     Returns
     -------
-        Both completed parts of the configuration.
+        Both completed parts of the configuration, completed.
 
     """
     # Assumes observation space is a Box.
