@@ -29,14 +29,13 @@ from __future__ import annotations
 
 import os
 
-from recordclass import recordclass, dataobject, asdict
-
 os.environ["MUJOCO_GL"] = os.getenv("MUJOCO_GL", "egl")
 os.environ["LAZY_LEGACY_OP"] = "0"
 import warnings
 
 warnings.filterwarnings("ignore")
 import time
+from typing import NamedTuple
 from collections import defaultdict, namedtuple
 from collections.abc import Callable
 from functools import partial
@@ -141,124 +140,59 @@ class TDMPC2TrainState:
         self.pi_optimizer = pi_optimizer
 
 
-AgentConfig = recordclass(
-    "AgentConfig",
-    [
-        "obs",
-        "batch_size",
-        "reward_coef",
-        "value_coef",
-        "consistency_coef",
-        "rho",
-        "lr",
-        "enc_lr_scale",
-        "grad_clip_norm",
-        "tau",
-        "discount_denom",
-        "discount_min",
-        "discount_max",
-        "discount",
-        "mpc",
-        "iterations",
-        "num_samples",
-        "num_elites",
-        "num_pi_trajs",
-        "horizon",
-        "min_std",
-        "max_std",
-        "temperature",
-        "log_std_min",
-        "log_std_max",
-        "log_std_dif",
-        "entropy_coef",
-        "num_bins",
-        "vmin",
-        "vmax",
-        "model_size",
-        "num_enc_layers",
-        "enc_dim",
-        "num_channels",
-        "mlp_dim",
-        "latent_dim",
-        "num_q",
-        "dropout",
-        "simnorm_dim",
-        "compile",
-        "bin_size",
-        "action_dim",
-        "episode_length",
-        "obs_shape",
-    ],
-)
+class AgentConfig(NamedTuple):
+    obs: str
+    batch_size: int
+    reward_coef: float
+    value_coef: float
+    consistency_coef: int
+    rho: float
+    lr: float
+    enc_lr_scale: float
+    grad_clip_norm: float
+    tau: float
+    discount_denom: float
+    discount_min: float
+    discount_max: float
+    discount: float | None
+    mpc: bool
+    iterations: int
+    num_samples: int
+    num_elites: int
+    num_pi_trajs: int
+    horizon: int
+    min_std: float
+    max_std: float
+    temperature: float
+    log_std_min: float
+    log_std_max: float
+    log_std_dif: float | None
+    entropy_coef: float
+    num_bins: int
+    vmin: float
+    vmax: float
+    model_size: int
+    num_enc_layers: int
+    enc_dim: int
+    num_channels: int
+    mlp_dim: int
+    latent_dim: int
+    num_q: int
+    dropout: float
+    simnorm_dim: int
+    compile: bool
+    bin_size: int | None
+    action_dim: int | None
+    episode_length: int | None
+    obs_shape: tuple[int]
 
-TrainingConfig = recordclass(
-    "TrainingConfig",
-    [
-        "eval_episodes",
-        "eval_freq",
-        "steps",
-        "buffer_size",
-        "seed_steps",
-        "progress_bar",
-    ],
-)
-
-FullTrainingConfig = recordclass(
-    "FullTrainingConfig",
-    [  # Fields are specified explicitly to prevent auto code inspection false positives
-        "obs",
-        "batch_size",
-        "reward_coef",
-        "value_coef",
-        "consistency_coef",
-        "rho",
-        "lr",
-        "enc_lr_scale",
-        "grad_clip_norm",
-        "tau",
-        "discount_denom",
-        "discount_min",
-        "discount_max",
-        "discount",
-        "mpc",
-        "iterations",
-        "num_samples",
-        "num_elites",
-        "num_pi_trajs",
-        "horizon",
-        "min_std",
-        "max_std",
-        "temperature",
-        "log_std_min",
-        "log_std_max",
-        "log_std_dif",
-        "entropy_coef",
-        "num_bins",
-        "vmin",
-        "vmax",
-        "model_size",
-        "num_enc_layers",
-        "enc_dim",
-        "num_channels",
-        "mlp_dim",
-        "latent_dim",
-        "num_q",
-        "dropout",
-        "simnorm_dim",
-        "compile",
-        "bin_size",
-        "action_dim",
-        "episode_length",
-        "obs_shape",
-        "eval_episodes",
-        "eval_freq",
-        "steps",
-        "buffer_size",
-        "seed_steps",
-        "progress_bar",
-    ],
-)
-
+class TrainingConfig(NamedTuple):
+    eval_episodes: int
+    eval_freq: int
+    steps: int
+    buffer_size: int
+    seed_steps: int | None
+    progress_bar: bool
 
 def make_agent_cfg(
     obs: str = "state",
@@ -738,7 +672,8 @@ class DefaultSuccessInfoWrapper(gym.Wrapper):
 
 
 def _train(
-    cfg: FullTrainingConfig,
+    agent_cfg: AgentConfig,
+    training_cfg: TrainingConfig,
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
     train_state: TDMPC2TrainState,
     rngs: nnx.Rngs,
@@ -748,10 +683,10 @@ def _train(
 ) -> TDMPC2AgentState:
     """Train a TD-MPC2 agent."""
     buffer = SubtrajectoryReplayBuffer(
-        buffer_size=min(cfg.buffer_size, cfg.steps),
-        horizon=cfg.horizon,
+        buffer_size=min(training_cfg.buffer_size, training_cfg.steps),
+        horizon=agent_cfg.horizon,
     )
-    scale = RunningScale(cfg)
+    scale = RunningScale(agent_cfg)
     step = 0
     ep_idx = 0
     start_time = time.time()
@@ -766,11 +701,11 @@ def _train(
     model_optim = train_state.model_optimizer
     pi_optim = train_state.pi_optimizer
 
-    progress = trange(step, cfg.steps, disable=not cfg.progress_bar)
+    progress = trange(step, training_cfg.steps, disable=not training_cfg.progress_bar)
 
     timer.start("training")
     timer.start("seed_acquisition")
-    for step in np.arange(step, cfg.steps + 1):
+    for step in np.arange(step, training_cfg.steps + 1):
         # Reset environment
         if done:
             if step > 0:
@@ -790,7 +725,7 @@ def _train(
             obs, _ = env.reset()
 
         # Collect experience
-        if step > cfg.seed_steps:
+        if step > training_cfg.seed_steps:
             timer.start("agent_act")
             t0 = steps_in_episode == 0
             action, previous_mean = act(
@@ -799,8 +734,9 @@ def _train(
                 obs=obs,
                 previous_mean=previous_mean,
                 rngs=rngs,
-                cfg=cfg,
+                cfg=agent_cfg,
                 t0=t0,
+                eval_mode=False,
             )
             timer.stop("agent_act")
         else:
@@ -824,25 +760,33 @@ def _train(
         episode_reward += float(reward)
 
         # Update agent
-        if step >= cfg.seed_steps:
-            if step == cfg.seed_steps:
-                num_updates = cfg.seed_steps
+        if step >= training_cfg.seed_steps:
+            if step == training_cfg.seed_steps:
+                num_updates = training_cfg.seed_steps
                 timer.stop("seed_acquisition")
                 print("Pretraining agent on seed data...")
             else:
                 num_updates = 1
             for i in range(num_updates):
                 timer.start("agent_update")
+                batch = buffer.sample_batch(
+                    batch_size=agent_cfg.batch_size,
+                    horizon=agent_cfg.horizon,
+                    include_intermediate=True,
+                    rng=np_rng,
+                )
+                obs_batch, action_batch, reward_batch = _prepare_batch(batch)
                 metrics = update(
                     model=model,
                     pi=pi,
                     model_optim=model_optim,
                     pi_optim=pi_optim,
                     scale=scale,
-                    buffer=buffer,
+                    obs=obs_batch,
+                    action=action_batch,
+                    reward=reward_batch,
                     rngs=rngs,
-                    np_rng=np_rng,
-                    cfg=cfg,
+                    cfg=agent_cfg,
                 )
                 timer.stop("agent_update")
                 progress.update()  # 1 update = 1 step, just not necessarily synchronously
@@ -1425,7 +1369,7 @@ def _model_loss(
 
 
 @partial(nnx.jit, static_argnames=["cfg"])
-def _update(
+def update(
     model: WorldModel,
     pi: nnx.Module,
     model_optim: nnx.Optimizer,
@@ -1454,6 +1398,7 @@ def _update(
         net=model.Qs,
         target_net=model.target_Qs,
         tau=cfg.tau,
+        filter=nnx.Param,
     )
 
     # Return training statistics
@@ -1477,9 +1422,9 @@ def _prepare_batch(batch):
         axis=-1,
     )
     next_obs = jnp.swapaxes(next_obs, 0, 1)
-    # terminated + truncated are not needed by TDMPC2._update()
+    # terminated + truncated are not needed by TDMPC2's update()
 
-    # TDMPC2._update() just needs a single obs sequence, not both
+    # TDMPC2's update() just needs a single obs sequence, not both
     # obs and next_obs, which share all the same observations but
     # one at the start and one at the end of a trajectory. Thus,
     # combine them to obtain an obs sequence that is 1 longer than
@@ -1487,48 +1432,6 @@ def _prepare_batch(batch):
     # shape of obs will then be ~(transitions+1, trajectories, ...)
     obs = jnp.concatenate([jnp.expand_dims(obs.at[0].get(), 0), next_obs])
     return obs, action, reward
-
-
-def update(
-    model: WorldModel,
-    pi: nnx.Module,
-    model_optim: nnx.Optimizer,
-    pi_optim: nnx.Optimizer,
-    scale: RunningScale,
-    buffer: SubtrajectoryReplayBuffer,
-    rngs: nnx.Rngs,
-    np_rng: np.random.Generator,
-    cfg: AgentConfig,
-):
-    """
-    Main update function. Corresponds to one iteration of model learning.
-
-    Args:
-            buffer (common.buffer.Buffer): Replay buffer.
-
-    Returns:
-            dict: Dictionary of training statistics.
-    """
-    batch = buffer.sample_batch(
-        batch_size=cfg.batch_size,
-        horizon=cfg.horizon,
-        include_intermediate=True,
-        rng=np_rng,
-    )
-    prepared_batch = _prepare_batch(batch)
-    obs, action, reward = prepared_batch
-    return _update(
-        model=model,
-        pi=pi,
-        model_optim=model_optim,
-        pi_optim=pi_optim,
-        scale=scale,
-        obs=obs,
-        action=action,
-        reward=reward,
-        rngs=rngs,
-        cfg=cfg,
-    )
 
 
 class WorldModel(nnx.Module):
@@ -1587,9 +1490,7 @@ class WorldModel(nnx.Module):
 
         This implementation assumes a single state-based observation.
         """
-        if self.cfg.obs == "rgb" and obs.ndim == 5:
-            return jnp.stack([self.encoder[self.cfg.obs](o) for o in obs])
-        return self.encoder[self.cfg.obs](obs)
+        return self.encoder(obs)
 
     def next(self, z: ArrayLike, a: ArrayLike) -> Array:
         """Predicts the next latent state given the current latent state
@@ -1940,32 +1841,22 @@ def conv(in_shape, num_channels, act=None):
     return nn.Sequential(*layers)
 
 
-def enc(cfg: AgentConfig, rngs: nnx.Rngs, out={}):
+def enc(cfg: AgentConfig, rngs: nnx.Rngs):
     """
-    Returns a dictionary of encoders for each observation in the dict.
-    """
-    for k in cfg.obs_shape.keys():
-        if k == "state":
-            out[k] = mlp(
-                in_dim=cfg.obs_shape[k][0],
-                mlp_dims=max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
-                out_dim=cfg.latent_dim,
-                rngs=rngs,
-                act=SimNorm(cfg.simnorm_dim),
-            )
-        elif k == "rgb":
-            raise NotImplementedError(
-                "Encoder for observation type rgb not fully ported to JAX/Flax."
-            )
-            out[k] = conv(
-                cfg.obs_shape[k], cfg.num_channels, act=SimNorm(cfg.simnorm_dim)
-            )
-        else:
-            raise NotImplementedError(
-                f"Encoder for observation type {k} not implemented."
-            )
-    return out
+    Returns an encoder for the Box-based observation.
 
+    Notes
+    -----
+    The original implementation supported Dict-based observations.
+    This functionality does not exist here, but may be implemented.
+    """
+    return mlp(
+        in_dim=cfg.obs_shape[0],
+        mlp_dims=max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
+        out_dim=cfg.latent_dim,
+        rngs=rngs,
+        act=SimNorm(cfg.simnorm_dim),
+    )
 
 def discount_heuristic(
     episode_length: int,
@@ -2032,31 +1923,41 @@ def complete_config(
         Both completed parts of the configuration.
 
     """
-    try:  # Dict
-        agent_cfg.obs_shape = {
-            k: v.shape for k, v in env.observation_space.spaces.items()
-        }
-    except:  # Box
-        agent_cfg.obs_shape = {agent_cfg.obs: env.observation_space.shape}
+    # Assumes observation space is a Box.
+    obs_shape = env.observation_space.shape
     # Bin size for discrete regression
-    agent_cfg.bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (
+    bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (
         agent_cfg.num_bins - 1
     )
-    agent_cfg.action_dim = env.action_space.shape[0]
-    agent_cfg.episode_length = env.spec.max_episode_steps
+    action_dim = env.action_space.shape[0]
+    episode_length = env.spec.max_episode_steps
     if training_cfg.seed_steps is None:
-        training_cfg.seed_steps = max(1000, 5 * agent_cfg.episode_length)
+        seed_steps = max(1000, 5 * episode_length)
+    else:
+        seed_steps = training_cfg.seed_steps
     # Heuristic for large action spaces
-    agent_cfg.iterations += 2 * int(agent_cfg.action_dim >= 20)
-    agent_cfg.discount = discount_heuristic(
-        episode_length=agent_cfg.episode_length,
+    iterations = agent_cfg.iterations + 2 * int(action_dim >= 20)
+    discount = discount_heuristic(
+        episode_length=episode_length,
         discount_denom=agent_cfg.discount_denom,
         discount_min=agent_cfg.discount_min,
         discount_max=agent_cfg.discount_max,
     )
-    agent_cfg.log_std_dif = agent_cfg.log_std_max - agent_cfg.log_std_min
-    return agent_cfg, training_cfg
+    log_std_dif = agent_cfg.log_std_max - agent_cfg.log_std_min
 
+    completed_agent_cfg = agent_cfg._replace(
+        obs_shape=obs_shape,
+        bin_size=bin_size,
+        action_dim=action_dim,
+        episode_length=episode_length,
+        iterations=iterations,
+        discount=discount,
+        log_std_dif=log_std_dif,
+    )
+    completed_training_cfg = training_cfg._replace(
+        seed_steps=seed_steps,
+    )
+    return completed_agent_cfg, completed_training_cfg
 
 def train_tdmpc2(
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
@@ -2108,11 +2009,11 @@ def train_tdmpc2(
     env = DefaultSuccessInfoWrapper(env)
 
     agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
-    full_cfg = FullTrainingConfig(*agent_cfg, *training_cfg)
     train_state = create_tdmpc2_train_state(agent_cfg, seed)
 
     return _train(
-        cfg=full_cfg,
+        agent_cfg=agent_cfg,
+        training_cfg=training_cfg,
         env=env,
         train_state=train_state,
         rngs=nnx.Rngs(seed),
