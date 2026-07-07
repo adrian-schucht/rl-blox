@@ -647,15 +647,6 @@ class RunningScale(nnx.Module):
         return x / self.value
 
 
-def make_dir(dir_path):
-    """Create directory if it does not already exist."""
-    try:
-        os.makedirs(dir_path)
-    except OSError:
-        pass
-    return dir_path
-
-
 def _train(
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
