@@ -1886,7 +1886,10 @@ def complete_config(
     # Assumes observation space is a Box.
     obs_shape = env.observation_space.shape
     # Bin size for discrete regression
-    bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (agent_cfg.num_bins - 1)
+    if agent_cfg.num_bins > 1:
+        bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (agent_cfg.num_bins - 1)
+    else:
+        bin_size = 0
     action_dim = env.action_space.shape[0]
     episode_length = env.spec.max_episode_steps
     if training_cfg.seed_steps is None:
