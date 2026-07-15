@@ -466,8 +466,8 @@ def make_training_cfg(
 
 @partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
 def soft_ce(
-    pred: ArrayLike,
-    target: ArrayLike,
+    pred: Array,
+    target: Array,
     vmin: float,
     vmax: float,
     bin_size: float,
@@ -477,6 +477,26 @@ def soft_ce(
     pred = nnx.log_softmax(pred, axis=-1)
     target = two_hot(target, vmin, vmax, bin_size, num_bins)
     return -jnp.sum(target * pred, axis=-1, keepdims=True)
+
+
+@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
+def reward_value_loss(
+    pred: Array,
+    target: Array,
+    vmin: float,
+    vmax: float,
+    bin_size: float,
+    num_bins: int,
+):
+    """Compute the cross entropy loss between predictions and soft targets."""
+    if num_bins > 1:
+        return soft_ce(pred, target, vmin, vmax, bin_size, num_bins)
+    elif num_bins == 1:
+        return mse_loss(symlog(pred), symlog(target))
+    elif num_bins == 0:
+        return mse_loss(pred, target)
+    else:
+        raise RuntimeError(f"Cannot compute reward_value_loss() for negative num_bins: {num_bins}")
 
 
 def safe_log_std(
@@ -1271,7 +1291,7 @@ def model_loss(
     ):
         reward_loss = (
             reward_loss
-            + soft_ce(
+            + reward_value_loss(
                 rew_pred_unbind,
                 rew_unbind,
                 cfg.vmin,
@@ -1284,7 +1304,7 @@ def model_loss(
         for _, qs_unbind_unbind in enumerate(jnp.unstack(qs_unbind, axis=0)):
             value_loss = (
                 value_loss
-                + soft_ce(
+                + reward_value_loss(
                     qs_unbind_unbind,
                     td_targets_unbind,
                     cfg.vmin,
