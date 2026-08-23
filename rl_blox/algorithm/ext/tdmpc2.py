@@ -1094,7 +1094,7 @@ def plan(
         score.squeeze(1),
         rngs,
     )
-    actions = jnp.squeeze(jnp.take(elite_actions, rand_idx, axis=1), axis=1)
+    actions = jnp.take(elite_actions, rand_idx, axis=1)
     a, std = actions.at[0].get(), std.at[0].get()
     if not eval_mode:
         a = a + std * rngs.normal(cfg.action_dim)
