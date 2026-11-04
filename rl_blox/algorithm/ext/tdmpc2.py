@@ -57,6 +57,7 @@ from rl_blox.blox.losses import mse_loss
 from rl_blox.blox.replay_buffer import SubtrajectoryReplayBuffer
 from rl_blox.blox.target_net import soft_target_net_update
 from rl_blox.blox.function_approximator.layer_norm_mlp import LayerNormMLP
+from rl_blox.blox.function_approximator.norm import simplicial_norm
 
 AGENT_CHECKPOINTING_ID = "agent"
 
@@ -1423,7 +1424,7 @@ class WorldModel(nnx.Module):
             mlp_dims=2 * [cfg.mlp_dim],
             out_dim=cfg.latent_dim,
             rngs=rngs,
-            act=SimNorm(cfg.simnorm_dim),
+            act=partial(simplicial_norm, dim=cfg.simnorm_dim),
         )
         self.reward = mlp(
             in_dim=cfg.latent_dim + cfg.action_dim,
@@ -1655,23 +1656,6 @@ class PixelPreprocess(nnx.Module):
         return jnp.true_divide(x, 255.0) - 0.5
 
 
-class SimNorm(nnx.Module):
-    """Simplicial normalization.
-
-    Adapted from https://arxiv.org/abs/2204.00616.
-    """
-
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-
-    def __call__(self, x: Array) -> Array:
-        shp = x.shape
-        x = jnp.reshape(x, [*shp[:-1], -1, self.dim])
-        x = nnx.softmax(x, axis=-1)
-        return jnp.reshape(x, shp)
-
-
 def mlp(
     in_dim: int,
     mlp_dims: list[int] | int,
@@ -1775,7 +1759,7 @@ def enc(cfg: AgentConfig, rngs: nnx.Rngs):
         mlp_dims=max(cfg.num_enc_layers - 1, 1) * [cfg.enc_dim],
         out_dim=cfg.latent_dim,
         rngs=rngs,
-        act=SimNorm(cfg.simnorm_dim),
+        act=partial(simplicial_norm, dim=cfg.simnorm_dim),
     )
 
 
