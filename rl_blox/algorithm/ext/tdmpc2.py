@@ -58,6 +58,12 @@ from rl_blox.blox.replay_buffer import SubtrajectoryReplayBuffer
 from rl_blox.blox.target_net import soft_target_net_update
 from rl_blox.blox.function_approximator.layer_norm_mlp import LayerNormMLP
 from rl_blox.blox.function_approximator.norm import simplicial_norm
+from rl_blox.blox.preprocessing import (
+    make_two_hot_bins,
+    two_hot_encoding,
+    two_hot_decoding,
+    two_hot_cross_entropy_loss,
+)
 
 AGENT_CHECKPOINTING_ID = "agent"
 
@@ -183,7 +189,6 @@ class AgentConfig(NamedTuple):
     dropout: float
     simnorm_dim: int
     compile: bool
-    bin_size: int | None
     action_dim: int | None
     episode_length: int | None
     obs_shape: tuple[int]
@@ -419,7 +424,6 @@ def make_agent_cfg(
         dropout=dropout,
         simnorm_dim=simnorm_dim,
         compile=compile,
-        bin_size=None,  # Set during training
         action_dim=None,  # Set during training
         episode_length=None,  # Set during training
         obs_shape=None,  # Set during training
@@ -466,39 +470,17 @@ def make_training_cfg(
     )
 
 
-@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
-def soft_ce(
-    pred: Array,
-    target: Array,
-    vmin: float,
-    vmax: float,
-    bin_size: float,
-    num_bins: int,
-):
-    """Compute the cross entropy loss between predictions and soft targets."""
-    pred = nnx.log_softmax(pred, axis=-1)
-    target = two_hot(target, vmin, vmax, bin_size, num_bins)
-    return -jnp.sum(target * pred, axis=-1, keepdims=True)
-
-
-@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
+@partial(jax.jit, static_argnames=["two_hot_bins"])
 def reward_value_loss(
     pred: Array,
     target: Array,
-    vmin: float,
-    vmax: float,
-    bin_size: float,
-    num_bins: int,
+    two_hot_bins: Array,
 ):
     """Compute the cross entropy loss between predictions and soft targets."""
-    if num_bins > 1:
-        return soft_ce(pred, target, vmin, vmax, bin_size, num_bins)
-    elif num_bins == 1:
-        return mse_loss(symlog(pred), symlog(target))
-    elif num_bins == 0:
-        return mse_loss(pred, target)
-    else:
-        raise RuntimeError(f"Cannot compute reward_value_loss() for negative num_bins: {num_bins}")
+    return jnp.expand_dims(
+        two_hot_cross_entropy_loss(two_hot_bins, pred, target),
+        axis=-1,
+    )
 
 
 def safe_log_std(
@@ -548,52 +530,6 @@ def symexp(x: ArrayLike) -> Array:
     Adapted from https://github.com/danijar/dreamerv3.
     """
     return jnp.sign(x) * (jnp.exp(jnp.abs(x)) - 1)
-
-
-@partial(jax.jit, static_argnames=["vmin", "vmax", "bin_size", "num_bins"])
-def two_hot(
-    x: ArrayLike,
-    vmin: float,
-    vmax: float,
-    bin_size: float,
-    num_bins: int,
-) -> Array:
-    """Convert array of scalars to soft two-hot encoded targets for discrete
-    regression"""
-    if num_bins == 0:
-        return jnp.array(x)
-    elif num_bins == 1:
-        return symlog(x)
-    x = jnp.clip(symlog(x), vmin, vmax).squeeze(axis=-1)
-    bin_idx = jnp.floor((x - vmin) / bin_size)
-    bin_offset = (x - vmin) / bin_size - bin_idx
-    soft_two_hot = jnp.zeros((x.shape[0], num_bins), dtype=x.dtype)
-    soft_two_hot = soft_two_hot.at[
-        jnp.arange(x.shape[0]), bin_idx.astype(dtype=int)
-    ].set(1 - bin_offset)
-    soft_two_hot = soft_two_hot.at[
-        jnp.arange(x.shape[0]), bin_idx.astype(dtype=int) + 1
-    ].set(bin_offset)
-    return soft_two_hot
-
-
-@partial(jax.jit, static_argnames=["vmin", "vmax", "num_bins"])
-def two_hot_inv(
-    x: ArrayLike,
-    vmin: float,
-    vmax: float,
-    num_bins: int,
-):
-    """Convert an array of soft two-hot encoded vectors to an array of
-    scalars."""
-    if num_bins == 0:
-        return jnp.array(x)
-    elif num_bins == 1:
-        return symexp(x)
-    dreg_bins = jnp.linspace(vmin, vmax, num_bins, dtype=x.dtype)
-    x = nnx.softmax(x, axis=-1)
-    x = jnp.sum(x * dreg_bins, axis=-1, keepdims=True)
-    return symexp(x)
 
 
 def gumbel_softmax_sample(
@@ -674,6 +610,7 @@ class RunningScale(nnx.Module):
 def _train(
     agent_cfg: AgentConfig,
     training_cfg: TrainingConfig,
+    two_hot_bins: Array,
     env: gym.Env[gym.spaces.Box, gym.spaces.Box],
     train_state: TDMPC2TrainState,
     rngs: nnx.Rngs,
@@ -737,6 +674,7 @@ def _train(
                 previous_mean=previous_mean,
                 rngs=rngs,
                 cfg=agent_cfg,
+                two_hot_bins=two_hot_bins,
                 t0=t0,
                 eval_mode=False,
             )
@@ -789,6 +727,7 @@ def _train(
                     reward=reward_batch,
                     rngs=rngs,
                     cfg=agent_cfg,
+                    two_hot_bins=two_hot_bins,
                 )
                 timer.stop("agent_update")
                 progress.update()  # 1 update = 1 step, just not necessarily synchronously
@@ -885,6 +824,7 @@ def act(
     previous_mean: Array | None,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
     t0: bool = False,
     eval_mode: bool = False,
 ) -> tuple[Array, Array]:
@@ -913,6 +853,7 @@ def act(
             obs=obs,
             rngs=rngs,
             cfg=cfg,
+            two_hot_bins=two_hot_bins,
             t0=t0,
             eval_mode=eval_mode,
         )
@@ -934,6 +875,7 @@ def act(
 
 def estimate_value(
     cfg: AgentConfig,
+    two_hot_bins: Array,
     model: WorldModel,
     pi: nnx.Module,
     z: Array,
@@ -947,18 +889,17 @@ def estimate_value(
     """
     G, discount = 0, 1
     for t in range(cfg.horizon):
-        reward = two_hot_inv(
-            model.reward_fwd(z, actions.at[t].get()),
-            cfg.vmin,
-            cfg.vmax,
-            cfg.num_bins,
+        reward = two_hot_decoding(
+            two_hot_bins, model.reward_fwd(z, actions.at[t].get())
         )
         z = model.next(z, actions[t])
         G = G + discount * reward
         discount_update = cfg.discount
         discount = discount * discount_update
     action, _ = sample_pi(pi, z, rngs, cfg)
-    return G + discount * model.Q(z, action, rngs=rngs, return_type="avg")
+    return G + discount * model.Q(
+        z, action, two_hot_bins, rngs=rngs, return_type="avg"
+    )
 
 
 @partial(nnx.jit, static_argnames=["cfg", "eval_mode"])
@@ -969,6 +910,7 @@ def plan(
     obs: Array,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
     t0: bool = False,
     eval_mode: bool = False,
 ) -> tuple[Array, Array]:
@@ -1061,7 +1003,7 @@ def plan(
         actions = actions.at[:, cfg.num_pi_trajs :].set(actions_sample)
 
         # Compute elite actions
-        value = estimate_value(cfg, model, pi, z, actions, rngs)
+        value = estimate_value(cfg, two_hot_bins, model, pi, z, actions, rngs)
         _, elite_idxs = jax.lax.top_k(
             value.squeeze(1),
             cfg.num_elites,
@@ -1121,6 +1063,7 @@ def pi_loss(
     zs: Array,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
 ) -> tuple[Array, dict[str, Array]]:
     """Calculate the loss of the policy on a sequence of latent states.
 
@@ -1138,7 +1081,9 @@ def pi_loss(
         WorldModel.pi().
     """
     action, info = sample_pi(pi, zs, rngs, cfg)
-    qs = model.Q(zs, action, rngs=rngs, return_type="avg")
+    qs = model.Q(
+        zs, action, two_hot_bins, rngs=rngs, return_type="avg"
+    )
     scale.update(qs.at[0].get())
     qs = scale(qs)
 
@@ -1160,6 +1105,7 @@ def update_pi(
     zs: Array,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
 ):
     """Update the policy using a sequence of latent states.
 
@@ -1181,7 +1127,7 @@ def update_pi(
         pi_loss,
         argnums=0,
         has_aux=True,
-    )(pi, model, scale, zs, rngs, cfg)
+    )(pi, model, scale, zs, rngs, cfg, two_hot_bins)
     pi_grad_norm = optax.tree_utils.tree_norm(pi_loss_grads, ord=2)
     pi_optim.update(pi, pi_loss_grads)
 
@@ -1237,6 +1183,7 @@ def model_loss(
     reward: Array,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
 ) -> tuple[Array, dict[str, Array]]:
     # Compute targets
     next_z = lax.stop_gradient(model.encode(obs[1:]))
@@ -1271,7 +1218,7 @@ def model_loss(
 
     # Predictions
     _zs = zs.at[:-1].get()
-    qs = model.Q(_zs, action, return_type="all")
+    qs = model.Q(_zs, action, two_hot_bins, return_type="all")
     reward_preds = model.reward_fwd(_zs, action)
 
     # Compute losses
@@ -1296,10 +1243,7 @@ def model_loss(
             + reward_value_loss(
                 rew_pred_unbind,
                 rew_unbind,
-                cfg.vmin,
-                cfg.vmax,
-                cfg.bin_size,
-                cfg.num_bins,
+                two_hot_bins,
             ).mean()
             * cfg.rho**t
         )
@@ -1309,10 +1253,7 @@ def model_loss(
                 + reward_value_loss(
                     qs_unbind_unbind,
                     td_targets_unbind,
-                    cfg.vmin,
-                    cfg.vmax,
-                    cfg.bin_size,
-                    cfg.num_bins,
+                    two_hot_bins,
                 ).mean()
                 * cfg.rho**t
             )
@@ -1348,6 +1289,7 @@ def update(
     reward: Array,
     rngs: nnx.Rngs,
     cfg: AgentConfig,
+    two_hot_bins: Array,
 ):
     # Update model
     (_model_loss, (model_info, zs)), model_loss_grads = nnx.value_and_grad(
@@ -1359,7 +1301,7 @@ def update(
     model_optim.update(model, model_loss_grads)
 
     # Update policy
-    pi_info = update_pi(pi, model, pi_optim, scale, zs, rngs, cfg)
+    pi_info = update_pi(pi, model, pi_optim, scale, zs, rngs, cfg, two_hot_bins)
 
     # Update target Q-functions
     soft_target_net_update(
@@ -1481,6 +1423,7 @@ class WorldModel(nnx.Module):
         self,
         z: Array,
         a: Array,
+        two_hot_bins: Array,
         return_type: Literal["min", "avg", "all"] = "min",
         rngs: nnx.Rngs | None = None,
         target: bool = False,
@@ -1512,9 +1455,7 @@ class WorldModel(nnx.Module):
             )
 
         q_idx = rngs.permutation(self.cfg.num_q)[:2]
-        q_value = two_hot_inv(
-            out.at[q_idx].get(), self.cfg.vmin, self.cfg.vmax, self.cfg.num_bins
-        )
+        q_value = two_hot_decoding(two_hot_bins, out.at[q_idx].get())
         if return_type == "min":
             return q_value.min(axis=0)
         return q_value.sum(axis=0) / 2
@@ -1843,11 +1784,6 @@ def complete_config(
     """
     # Assumes observation space is a Box.
     obs_shape = env.observation_space.shape
-    # Bin size for discrete regression
-    if agent_cfg.num_bins > 1:
-        bin_size = (agent_cfg.vmax - agent_cfg.vmin) / (agent_cfg.num_bins - 1)
-    else:
-        bin_size = 0
     action_dim = env.action_space.shape[0]
     episode_length = env.spec.max_episode_steps
     if training_cfg.seed_steps is None:
@@ -1929,11 +1865,17 @@ def train_tdmpc2(
     env = DefaultSuccessInfoWrapper(env)
 
     agent_cfg, training_cfg = complete_config(env, agent_cfg, training_cfg)
+    two_hot_bins = make_two_hot_bins(
+        lower_exponent=agent_cfg.vmin,
+        upper_exponent=agent_cfg.vmax,
+        n_bin_edges=agent_cfg.num_bins,
+    )
     train_state = create_tdmpc2_train_state(agent_cfg, seed)
 
     return _train(
         agent_cfg=agent_cfg,
         training_cfg=training_cfg,
+        two_hot_bins=two_hot_bins,
         env=env,
         train_state=train_state,
         rngs=nnx.Rngs(seed),
