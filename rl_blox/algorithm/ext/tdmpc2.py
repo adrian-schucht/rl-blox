@@ -56,6 +56,7 @@ from rl_blox.logging.timer import Timer
 from rl_blox.blox.losses import mse_loss
 from rl_blox.blox.replay_buffer import SubtrajectoryReplayBuffer
 from rl_blox.blox.target_net import soft_target_net_update
+from rl_blox.blox.function_approximator.layer_norm_mlp import LayerNormMLP
 
 AGENT_CHECKPOINTING_ID = "agent"
 
@@ -1671,35 +1672,6 @@ class SimNorm(nnx.Module):
         return jnp.reshape(x, shp)
 
 
-class NormedLinear(nnx.Linear):
-    """
-    Linear layer with LayerNorm, activation, and optionally dropout.
-    """
-
-    def __init__(
-        self,
-        *args,
-        rngs: nnx.Rngs,
-        dropout: float = 0.0,
-        act: Callable[..., Any] | None = None,
-        **kwargs,
-    ):
-        super().__init__(*args, rngs=rngs, **kwargs)
-        self.ln = nnx.LayerNorm(
-            num_features=self.out_features,
-            rngs=rngs,
-        )
-        self.act = act if act is not None else jax.nn.mish
-        self.dropout = nnx.Dropout(dropout, rngs=rngs) if dropout else None
-
-    @override
-    def __call__(self, x: Array) -> Array:
-        x = super().__call__(x)
-        if self.dropout:
-            x = self.dropout(x)
-        return self.act(self.ln(x))
-
-
 def mlp(
     in_dim: int,
     mlp_dims: list[int] | int,
@@ -1740,48 +1712,30 @@ def mlp(
         lower=-2.0 / std,
         upper=2.0 / std,
     )
-    last_layer_kernel_init = (
-        nnx.initializers.constant(0.0)
+    output_kernel_init = (
+        nnx.initializers.zeros_init
         if last_layer_inits_to_zero
         else kernel_init
     )
-    bias_init = nnx.initializers.constant(0.0)
+    bias_init = nnx.initializers.zeros_init
+    dropout_rates = [0.0] * mlp_dims
+    if len(dropout_rates) > 0:
+        # reference impl applies dropout just to the first hidden layer
+        dropout_rates[0] = dropout 
     if isinstance(mlp_dims, int):  # just one hidden layer
         mlp_dims = [mlp_dims]
-    dims = [in_dim] + mlp_dims + [out_dim]
-    layers: list[nnx.Module] = []
-    for i in range(len(dims) - 2):
-        layers.append(
-            NormedLinear(
-                dims[i],
-                dims[i + 1],
-                rngs=rngs,
-                dropout=dropout * (i == 0),
-                kernel_init=kernel_init,
-                bias_init=bias_init,
-            )
-        )
-    layers.append(
-        NormedLinear(
-            dims[-2],
-            dims[-1],
-            rngs=rngs,
-            act=act,
-            dropout=0.0,
-            kernel_init=last_layer_kernel_init,
-            bias_init=bias_init,
-        )
-        if act
-        else nnx.Linear(
-            dims[-2],
-            dims[-1],
-            rngs=rngs,
-            kernel_init=last_layer_kernel_init,
-            bias_init=bias_init,
-        )
+    return LayerNormMLP(
+        n_features=in_dim,
+        n_outputs=out_dim,
+        hidden_nodes=mlp_dims,
+        activation=jax.nn.mish,
+        rngs=rngs,
+        output_activation=act,
+        dropout_rates=dropout_rates,
+        kernel_init=kernel_init,
+        output_kernel_init=output_kernel_init,
+        biast_init=bias_init,
     )
-    result = nnx.Sequential(*layers)
-    return result
 
 
 def conv(in_shape, num_channels, act=None):
