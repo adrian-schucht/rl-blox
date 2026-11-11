@@ -355,6 +355,7 @@ class SubtrajectoryReplayBuffer(_BatchStorage):
         mrq_mode: bool = True,
         on_device: bool = False,
     ):
+        print("CONSTRUCTIVE!")
         assert buffer_size > 0
         assert horizon > 0
 
