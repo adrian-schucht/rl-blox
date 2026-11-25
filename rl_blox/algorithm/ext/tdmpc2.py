@@ -60,6 +60,20 @@ from rl_blox.blox.target_net import soft_target_net_update
 AGENT_CHECKPOINTING_ID = "agent"
 
 MODEL_SIZE = {  # parameters (M)
+    -4: {
+        "enc_dim": 64,
+        "mlp_dim": 96,
+        "latent_dim": 32,
+        "num_enc_layers": 2,
+        "num_q": 2,
+    },
+    -2: {
+        "enc_dim": 128,
+        "mlp_dim": 192,
+        "latent_dim": 64,
+        "num_enc_layers": 2,
+        "num_q": 2,
+    },
     1: {
         "enc_dim": 256,
         "mlp_dim": 384,
